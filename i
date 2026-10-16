@@ -44,7 +44,7 @@ umask 022
 ORIG_LOCALE="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
 export LC_ALL=C.UTF-8                      # megbízható karakterszámolás (kerethez) és angol eszköz-üzenetek (a hibafelismeréshez)
 
-INSTALLER_REV="2026.10.2"
+INSTALLER_REV="2026.10.3"
 REPO="${KIRAKAT_REPO:-GameKiller168/odroid-signage}"
 API_HOST="api.github.com"
 APP_DIR="${KIRAKAT_APP_DIR:-/opt/signage}"
@@ -70,8 +70,11 @@ MAX_UNPACKED=$((1024 * 1024 * 1024))
 MAX_ENTRIES=50000
 STEP_TOTAL=9
 APT_LOCK_WAIT="${KIRAKAT_APT_LOCK_WAIT:-600}"            # mp: ennyit vár egy másik apt/dpkg folyamatra
+APT_PREV_WAIT="${KIRAKAT_APT_PREV_WAIT:-2400}"           # mp: ennyit vár az ELŐZŐ, megszakadt telepítés (árván tovább dolgozó) apt-jére: a csomagtelepítés 5–15 perc, lassú vonalon több
+APT_POLL="${KIRAKAT_APT_POLL:-3}"                        # mp: a zárra várakozás lekérdezési üteme
 START_WAIT="${KIRAKAT_START_WAIT:-180}"                  # mp: ennyit vár a szerver indulására
 POLL="${KIRAKAT_POLL:-1}"                                # mp: a várakozó ciklusok lekérdezési üteme
+PROBE_BACKOFF="${KIRAKAT_PROBE_BACKOFF:-2}"              # mp: az 1. lépés hálózati próbáinak újrapróbálása előtt ennyit (majd a kétszeresét) vár
 PLAYER_STABLE_SECS="${KIRAKAT_PLAYER_STABLE:-6}"
 HOOK_TIMEOUT="${KIRAKAT_HOOK_TIMEOUT:-300}"              # mp: egy kiegészítő horog (apt-https.sh, apply-network.sh) legfeljebb ennyi ideig futhat
 
@@ -86,18 +89,18 @@ CHECK=0; YES=0; NO_PLAYER=0; KEEP_OS_PW=0; NO_COLOR_FLAG=0
 APP_USER=""; APP_GROUP=""; APP_UID=""
 WORK=""; WORK_LOG=""; LOG_FLUSHED=0; CACHE=""; TREE=""
 SECRETS=""; RT_DIR=""; STAGE=""; RTREE=""; VERIFIED_SHA=""; SUDO_FRESH=0; RUNNING_VERSION=""; HAVE_NET_HOOK=0
-HAVE_TTY=0; IS_TTY=0; LIVE=0; COLOR=0; UNI=0; COLS=80; COMPACT=0
+HAVE_TTY=0; IS_TTY=0; LIVE=0; COLOR=0; COLS=80; COMPACT=0
 STEP_N=0; STEP_NAME=""; STEP_T0=0; RUN_T0=$SECONDS
 INTERRUPTED=0; SIGNAME=""; FAIL_CAUSE=""; FAIL_TODO=""; IN_EXIT=0; SUDO_OK=0; OS_PW_APPLIED=0
-KEEPALIVE_PID=""; MAIN_PID=$$; LOCK_PID=""
+KEEPALIVE_PID=""; MAIN_PID=$$; LOCK_PID=""; PREV_STEP=""
 AUTH_HDR=""; TOKEN_FILE_OUT=""; KEY_FILE=""; HAVE_TOKEN=0; HAVE_KEY=0; PENDING_CODE=""
 CONSOLE_TTY=""; ON_TTY1=0; PLAYER_DEFERRED=0
 PKG_URL=""; PKG_SIZE=0
 TAG=""; TARGET_VERSION=""; TARBALL_URL=""; SUMS_URL=""; SHA_ASSET_URL=""; NOTE_SHA=""; EXPECT_SHA=""; TGZ=""
 INSTALLED_VERSION=""; LAYOUT="flat"; RANDOM_PW=""; OS_PW_MODE=""; CLOCK_FIX_EPOCH=""; HTTP_DATE_EPOCH=""
-MAC=""; STATUS_JSON_NAME=""; STATUS_STATE=""; STATUS_CONFIGURED=""; STATUS_ID=""; SSH_NOTE=""; APT_NOTE=""; PLAYER_NOTE=""
+MAC=""; STATUS_JSON_NAME=""; STATUS_CONFIGURED=""; SSH_NOTE=""; APT_NOTE=""; PLAYER_NOTE=""
 CURL_SEC=(--proto '=https' --proto-redir '=https' --tlsv1.2)
-FETCH_CODE=0; FETCH_RC=0; FETCH_HDR=""; FETCH_LOC=""
+FETCH_CODE=0; FETCH_RC=0; FETCH_HDR=""; FETCH_LOC=""; FETCH_ERR=""
 TICK=0
 
 # =====================================================================================================================
@@ -356,7 +359,7 @@ PY
 # Megjelenítés (TUI): színek csak terminálon, NO_COLOR-t tiszteletben tartja, terminál-szélesség szerint
 # =====================================================================================================================
 C_RST=""; C_B=""; C_DIM=""; C_OK=""; C_WARN=""; C_BAD=""; C_HDR=""
-G_OK="+"; G_BAD="x"; G_WARN="!"; G_DOT="-"; G_ELL="~"; G_ARR=">"
+G_OK="+"; G_BAD="x"; G_WARN="!"; G_DOT="-"; G_ELL="~"
 BOX_TL="+"; BOX_TR="+"; BOX_BL="+"; BOX_BR="+"; BOX_H="-"; BOX_V="|"; BOX_ML="+"; BOX_MR="+"
 SPIN=('|' '/' '-' '\'); SPIN_N=4
 LIVE_ON=0; BAR=""
@@ -378,8 +381,7 @@ ui_init() {
   fi
   # Unicode csak UTF-8 területi beállításnál és nem a Linux-konzolon (annak betűkészletéből hiányozhat a jel)
   if [[ $ORIG_LOCALE =~ [Uu][Tt][Ff]-?8 && ${TERM:-} != linux ]]; then
-    UNI=1
-    G_OK="✔"; G_BAD="✘"; G_WARN="!"; G_DOT="·"; G_ELL="…"; G_ARR="→"
+    G_OK="✔"; G_BAD="✘"; G_WARN="!"; G_DOT="·"; G_ELL="…"
     BOX_TL="┌"; BOX_TR="┐"; BOX_BL="└"; BOX_BR="┘"; BOX_H="─"; BOX_V="│"; BOX_ML="├"; BOX_MR="┤"
     SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'); SPIN_N=10
   fi
@@ -949,7 +951,7 @@ fetch_follow() {
   local url=$1 out=$2 auth=${3:-0} accept=${4:-} maxbytes=${5:-$((50 * 1024 * 1024))} maxtime=${6:-60} label=${7:-} total=${8:-0}
   local hops=0 wfile="$WORK/curl.w" errf="$WORK/curl.err" hdr="$WORK/curl.hdr" pid rc line
   local -a args
-  FETCH_HDR=$hdr; FETCH_CODE=0; FETCH_RC=0; FETCH_LOC=""
+  FETCH_HDR=$hdr; FETCH_CODE=0; FETCH_RC=0; FETCH_LOC=""; FETCH_ERR=""
   while (( hops <= 5 )); do
     url_ok "$url" || { FETCH_RC=-1; log "nem engedélyezett cím: $(strip_url "$url")"; return 1; }
     args=("${CURL_SEC[@]}" -sS --connect-timeout 15 --max-time "$maxtime" --speed-limit 1024 --speed-time 30 --max-filesize "$maxbytes"
@@ -968,6 +970,7 @@ fetch_follow() {
     FETCH_RC=$rc
     if (( rc != 0 )); then
       line="$(head -n 1 "$errf" 2>/dev/null || true)"; log "curl hiba ($rc): ${line:0:200}"
+      FETCH_ERR=$line
       return 1
     fi
     line="$(cat "$wfile")"
@@ -1000,13 +1003,13 @@ fetch_retry() {
 
 DL_TOO_BIG=0
 dl_monitor() {  # $1 curl-pid, $2 fájl, $3 fejléc-fájl, $4 címke, $5 várt méret (0 = ismeretlen), $6 felső korlát
-  local pid=$1 f=$2 hdr=$3 label=$4 total=${5:-0} max=$6 t0 size=0 pct right speed eta len avg i
+  local pid=$1 dlfile=$2 hdr=$3 label=$4 total=${5:-0} max=$6 t0 size=0 pct right speed eta len avg i
   local -a ts=() ss=()
   now_ms; t0=$NOW_MS
   ui_progress_reset
   DL_TOO_BIG=0
   while kill -0 "$pid" 2>/dev/null; do
-    now_ms; file_size "$f"; size=$FSIZE
+    now_ms; file_size "$dlfile"; size=$FSIZE
     if (( size > max )); then kill "$pid" 2>/dev/null || true; DL_TOO_BIG=1; break; fi
     if [[ -s $hdr ]]; then
       len="$(hdr_get "$hdr" content-length)"
@@ -1034,12 +1037,13 @@ dl_monitor() {  # $1 curl-pid, $2 fájl, $3 fejléc-fájl, $4 címke, $5 várt m
   done
   PROG_SHORT=""; PROG_SPEED=""
   # záró sor (a kész állapot): a teljes méret és az átlagsebesség
-  file_size "$f"; size=$FSIZE
+  file_size "$dlfile"; size=$FSIZE
   now_ms; i=$(( NOW_MS - t0 )); (( i < 1 )) && i=1
   avg=$(( size * 1000 / i ))
   ui_live_clear
   if (( size > 0 )); then
-    local tail_txt="100%  $(fmt_bytes "$size")  átlag $(fmt_bytes "$avg")/s  ($(fmt_dur $(( i / 1000 ))))" bw
+    local tail_txt bw
+    tail_txt="100%  $(fmt_bytes "$size")  átlag $(fmt_bytes "$avg")/s  ($(fmt_dur $(( i / 1000 ))))"
     if (( COMPACT )); then
       ui_text 4 "    " "      " "" "$label kész: $(fmt_bytes "$size"), átlag $(fmt_bytes "$avg")/s ($(fmt_dur $(( i / 1000 ))))"
     else
@@ -1057,18 +1061,30 @@ dl_monitor() {  # $1 curl-pid, $2 fájl, $3 fejléc-fájl, $4 címke, $5 várt m
 # 1. lépés – előellenőrzés
 # =====================================================================================================================
 NET_FAILS=(); CLOCK_SUSPECT=0; HARD_RCS=()
-probe_https() {   # $1 gazdagép → 0 elérhető; egyébként PROBE_RC; a Date fejléc a $WORK/probe.hdr-ben
-  local rc=0 code pid
-  : >"$WORK/probe.code"
-  curl "${CURL_SEC[@]}" -sS -I -o /dev/null -D "$WORK/probe.hdr" -w '%{http_code}' --connect-timeout 8 --max-time 15 \
-       -H "User-Agent: kirakat-install/$INSTALLER_REV" "https://$1/" >"$WORK/probe.code" 2>"$WORK/probe.err" </dev/null &
-  pid=$!
-  wait "$pid" || rc=$?                      # a háttérben fut, hogy egy jel azonnal megszakíthassa
-  code="$(<"$WORK/probe.code")"
-  PROBE_RC=$rc
-  if (( rc == 0 )) && [[ $code =~ ^[1-5][0-9][0-9]$ ]]; then return 0; fi
-  log "probe $1: curl=$rc http=${code:-?} $(head -n 1 "$WORK/probe.err" 2>/dev/null)"
-  return 1
+# A próba az ÁTMENETI hibákat (DNS-időtúllépés, lassú első kapcsolat, megszakadt kézfogás) néhányszor újrapróbálja, mielőtt hibának számít: az első képernyőn egy akadozó név- vagy kapcsolat-felépítés ne állítsa meg a telepítést.
+# A curl 28-as kódja (időtúllépés) a NÉVFELOLDÁS időtúllépése is lehet ("Resolving timed out", pl. ha a tűzfal eldobja a DNS-kérdéseket, vagy a két névszerverből egyik sem válaszol): az üzenet alapján ez
+# DNS-hiba (6-os kód), nem "a 443-as port tiltott" – különben az IT-t a rossz dologra kérnénk meg.
+probe_https() {   # $1 gazdagép [$2 próbák száma, alap 3] → 0 elérhető; egyébként PROBE_RC (az utolsó próba kódja); a Date fejléc a $WORK/probe.hdr-ben
+  local rc code pid msg try=1 tries=${2:-3}
+  while :; do
+    rc=0
+    : >"$WORK/probe.code"
+    curl "${CURL_SEC[@]}" -sS -I -o /dev/null -D "$WORK/probe.hdr" -w '%{http_code}' --connect-timeout 8 --max-time 15 \
+         -H "User-Agent: kirakat-install/$INSTALLER_REV" "https://$1/" >"$WORK/probe.code" 2>"$WORK/probe.err" </dev/null &
+    pid=$!
+    wait "$pid" || rc=$?                      # a háttérben fut, hogy egy jel azonnal megszakíthassa
+    code="$(<"$WORK/probe.code")"
+    PROBE_RC=$rc
+    if (( rc == 0 )) && [[ $code =~ ^[1-5][0-9][0-9]$ ]]; then return 0; fi
+    msg="$(head -n 1 "$WORK/probe.err" 2>/dev/null || true)"
+    log "probe $1 ($try/$tries): curl=$rc http=${code:-?} $msg"
+    if [[ $rc == 28 && $msg == *"Resolving timed out"* ]]; then PROBE_RC=6; fi
+    case $rc in 6|7|28|35|52|55|56) ;; *) return 1 ;; esac      # a többi (pl. TLS-tanúsítvány) hiba újrapróbálással nem múlik el
+    if (( try >= tries )); then return 1; fi
+    try=$((try + 1))
+    ui_live "hálózat: $1… (újrapróbálom: $try/$tries)"
+    if (( PROBE_BACKOFF > 0 )); then sleep $(( (try - 1) * PROBE_BACKOFF )) & wait $! || true; fi
+  done
 }
 
 # Ha a környezetben proxy van beállítva (https_proxy …), a curl azon át kapcsolódik – hibánál ez a leggyakoribb, nem látszó ok. Kimenet: a jegyzet (vagy üres).
@@ -1152,7 +1168,8 @@ probe_network() {
   fi
   for h in "$API_HOST" github.com codeload.github.com; do
     ui_live "hálózat: $h…"
-    if probe_https "$h"; then
+    # ha egy gazdagép már végleg elbukott, a telepítés úgyis megáll: a többi csak egyszer próbálkozik (a hibás hálózat ne tartson percekig)
+    if probe_https "$h" $(( ${#NET_FAILS[@]} ? 1 : 3 )); then
       ui_ok "hálózat: $h:443 elérhető"
       if [[ -z $HTTP_DATE_EPOCH ]]; then set_http_date; fi
     else
@@ -1161,12 +1178,21 @@ probe_network() {
     fi
   done
   ui_live_clear
+  # ha mindhárom GitHub-gazdagép neve feloldhatatlan (DNS), a többi próba (kiadás-mellékletek, csomagtárak) ugyanígy elbukna: percekig tartana, és félrevezető „443-as kimenő forgalom” tanácsot adna
+  # – a hiba oka egyértelműen a DNS, azt mondjuk ki
+  local dns_down=0
+  if (( ${#NET_FAILS[@]} >= 3 )); then
+    dns_down=1
+    for f in "${NET_FAILS[@]}"; do if [[ ${f##*|} != 6 ]]; then dns_down=0; fi; done
+  fi
   # a kiadás-mellékletek (a saját csomag, a SHA256SUMS) a GitHub tárolóján át, átirányítással érkeznek: a régi és az új gazdagép is lehet
-  for h in objects.githubusercontent.com release-assets.githubusercontent.com; do
-    if ! probe_https "$h"; then ui_warn "$h:443 nem érhető el – a kiadás-mellékletek (csomag, SHA256SUMS) letöltése hibázhat; kérd meg az IT-t, hogy engedélyezze"; fi
-  done
+  if (( ! dns_down )); then
+    for h in objects.githubusercontent.com release-assets.githubusercontent.com; do
+      if ! probe_https "$h" $(( ${#NET_FAILS[@]} ? 1 : 2 )); then ui_warn "$h:443 nem érhető el – a kiadás-mellékletek (csomag, SHA256SUMS) letöltése hibázhat; kérd meg az IT-t, hogy engedélyezze"; fi
+    done
+  fi
   clock_check
-  probe_apt_hosts
+  if (( ! dns_down )); then probe_apt_hosts; fi
   for f in "${NET_FAILS[@]}"; do
     hh=${f%%|*}; cc=${f##*|}
     case $cc in
@@ -1371,6 +1397,7 @@ api_error() {   # HTTP-kód alapján emberi hiba (kilép)
 
 net_error() {   # curl-hiba alapján emberi hiba (kilép); $1 = download: a letöltés közbeni hiba (a 28-as kód ilyenkor lassú / megakadt kapcsolatot jelent)
   local rc=$FETCH_RC ctx=${1:-}
+  if [[ $rc == 28 && $FETCH_ERR == *"Resolving timed out"* ]]; then rc=6; fi     # a névfeloldás időtúllépése DNS-hiba, nem tiltott port (lásd probe_https)
   case $rc in
     6) fail "a névfeloldás (DNS) nem működik" "Ellenőrizd a hálózati kábelt és a DNS-t (kérd meg az IT-t), majd futtasd újra." ;;
     28) if [[ $ctx == download ]]; then
@@ -1720,14 +1747,24 @@ apt_busy() {    # 0, ha egy másik apt / dpkg / automatikus frissítés fut
   pgrep -x 'apt|apt-get|dpkg|aptitude' >/dev/null 2>&1 || pgrep -f '/unattended-upgrade( |$)' >/dev/null 2>&1
 }
 
+# $1 = prev: az ELŐZŐ futás az 5. lépésnél (rendszer-előkészítés) szakadt meg. Ilyenkor az apt-get – ha az SSH-kapcsolat (HUP) vagy a terminál szűnt meg – árván tovább dolgozik, és a lock-ot
+# tartja: ezt kimondjuk, és tovább várunk rá (a csomagtelepítés 5–15 perc, lassú céges vonalon több), mint egy ismeretlen másik csomagkezelőre.
 wait_apt_lock() {
-  local waited=0 told=0
+  local waited=0 told=0 limit=$APT_LOCK_WAIT prev=${1:-}
+  if [[ $prev == prev ]]; then limit=$APT_PREV_WAIT; fi
   while apt_busy; do
     # (egyszer, tartósan kiírva: a pörgettyű csak élő terminálon látszik, és az első indítás automatikus frissítése percekig tarthat)
-    if (( ! told )); then told=1; ui_info "egy másik csomagkezelő (pl. az első indítás automatikus frissítése) dolgozik – megvárom, legfeljebb $(fmt_dur "$APT_LOCK_WAIT") ideig"; fi
-    if (( waited >= APT_LOCK_WAIT )); then fail "másik csomagkezelő (apt/dpkg) foglalja a zárat $(fmt_dur "$waited") óta" "Várd meg, míg befejezi (pl. automatikus frissítés), majd futtasd újra ugyanazt a parancsot."; fi
-    ui_live "${SPIN[$((TICK % SPIN_N))]} várok egy másik csomagkezelőre (automatikus frissítés fut)… $(fmt_dur "$waited")"
-    TICK=$((TICK + 1)); sleep 3; waited=$((waited + 3))
+    if (( ! told )); then
+      told=1
+      if [[ $prev == prev ]]; then ui_info "az előző, megszakadt telepítés csomagtelepítése (vagy egy automatikus frissítés) még fut a háttérben – megvárom, legfeljebb $(fmt_dur "$limit") ideig"
+      else ui_info "egy másik csomagkezelő (pl. az első indítás automatikus frissítése) dolgozik – megvárom, legfeljebb $(fmt_dur "$limit") ideig"; fi
+    fi
+    if (( waited >= limit )); then
+      if [[ $prev == prev ]]; then fail "az előző, megszakadt telepítés csomagkezelője (apt/dpkg) még mindig foglalja a zárat $(fmt_dur "$waited") óta" "Várd meg, míg befejezi (lassú hálózaton tovább tart), majd futtasd újra ugyanazt a parancsot."; fi
+      fail "másik csomagkezelő (apt/dpkg) foglalja a zárat $(fmt_dur "$waited") óta" "Várd meg, míg befejezi (pl. automatikus frissítés), majd futtasd újra ugyanazt a parancsot."
+    fi
+    ui_live "${SPIN[$((TICK % SPIN_N))]} várok egy másik csomagkezelőre ($([[ $prev == prev ]] && echo 'az előző telepítés apt-je' || echo 'automatikus frissítés fut'))… $(fmt_dur "$waited")"
+    TICK=$((TICK + 1)); sleep "$APT_POLL"; waited=$((waited + APT_POLL))
   done
   ui_live_clear
   (( waited == 0 )) || ui_info "a csomagkezelő felszabadult ($(fmt_dur "$waited") várakozás után)"
@@ -1903,10 +1940,13 @@ recover_app_dir() {
 }
 
 # Kiegészítő horog (más fejlesztési ág szkriptje) futtatása a gyökér-tulajdonú ellenőrzött másolatból, időkorláttal és élő állapotsorral; a hiba csak figyelmeztetés
-run_hook() {    # $1 a szkript neve a system/ alatt, $2 felirat
+HOOK_RC=0
+run_hook() {    # $1 a szkript neve a system/ alatt, $2 felirat; a kilépési kód a HOOK_RC-ben (a hívó így nem mondja „kész”-nek a figyelmeztetett horgot)
   local name=$1 label=$2 rc=0
-  [[ -n $RTREE ]] || { ui_warn "a(z) $name kihagyva (nincs ellenőrzött másolat)"; return 0; }
+  HOOK_RC=0
+  [[ -n $RTREE ]] || { ui_warn "a(z) $name kihagyva (nincs ellenőrzött másolat)"; HOOK_RC=1; return 0; }
   run_spin "$label" timeout -k 5 "$HOOK_TIMEOUT" "${SUDO[@]}" env APP_USER="$APP_USER" bash "$RTREE/system/$name" || rc=$?
+  HOOK_RC=$rc
   case $rc in
     0) ;;
     124|137) ui_warn "a(z) $name ${HOOK_TIMEOUT} mp alatt sem fejeződött be – megszakítottam (folytatom; a napló részletezi)" ;;
@@ -1947,7 +1987,7 @@ step_system() {
   else
     ui_warn "az eszköz az automatikus frissítő elrendezését használja (releases/current): az alkalmazásfájlokat nem cserélem – a frissítést a Karbantartás oldal / az éjszakai frissítő végzi"
   fi
-  wait_apt_lock
+  wait_apt_lock "$([[ $PREV_STEP == 5 ]] && echo prev)"
   fix_dpkg_state
 
   # kiegészítő horog (más fejlesztési ág szkriptje): ha a kiadás tartalmazza, lefut; nélküle a telepítő önállóan is teljes. (Az apply-network.sh a telepítés VÉGÉN fut, lásd apply_network_last.)
@@ -2016,8 +2056,9 @@ CONF
   ui_step_done
 }
 
-# A hálózati beállítás (DHCP-azonosító = MAC) az UTOLSÓ művelet: közben a címe megváltozhat, és egy SSH-munkamenet megszakadhat – addigra minden kész, az összegzés kiírva.
-# Az új címet a végén kiírjuk.
+# A hálózati beállítás (DHCP-azonosító = MAC) az UTOLSÓ művelet. Az install-system.sh az 5. lépésben már előkészítette (élő hálózat érintése nélkül: a netplan-fájlt írja és ellenőrzi, a
+# beállítás újraindításkor lép életbe); ez a végső, idempotens futtatás után a cím mégis változhat, és egy SSH-munkamenet megszakadhat – addigra minden kész, az összegzés kiírva.
+# Az új címet a végén kiírjuk; ha a szkript nem módosított (nem 0-s kilépési kód), azt kimondjuk, és nem mondjuk „kész”-nek.
 apply_network_last() {
   (( HAVE_NET_HOOK )) && [[ -n $RTREE ]] || return 0
   local before after prev i
@@ -2031,6 +2072,8 @@ apply_network_last() {
   done
   if [[ $before != "$after" ]]; then
     ui_warn "A hálózati beállítás után megváltozott az IP-cím: ${before:-nincs} → ${after:-nincs}. Ha SSH-n vagy, a kapcsolat megszakadhat: lépj be újra az új címen (és ha a DHCP-szerveren foglalás van, igazítsd a kliensazonosítóhoz)."
+  elif (( HOOK_RC != 0 )); then
+    ui_info "a hálózati beállítás nem történt meg (lásd fent); az IP-cím változatlan: ${after:-nincs} – a DHCP-foglalást ilyenkor a DHCP-szerver által mutatott kliensazonosítóra kell kérni"
   else
     ui_ok "hálózati beállítás kész (IP-cím: ${after:-nincs})"
   fi
@@ -2288,7 +2331,7 @@ local_status() {   # a helyi szerver /api/public/status válasza → STATUS_* (0
   local out="" rc=0
   out="$(curl --proto '=http,https' -sS --max-time 3 -H 'Accept: application/json' "$LOCAL_URL/api/public/status" 2>/dev/null </dev/null | python3 -I -c "$PY_STATUS" 2>/dev/null)" || rc=$?
   [[ $out == ok$'\t'* ]] || return 1
-  IFS=$'\t' read -r _ STATUS_VERSION STATUS_STATE STATUS_CONFIGURED STATUS_JSON_NAME STATUS_ID <<<"$out"
+  IFS=$'\t' read -r _ STATUS_VERSION _ STATUS_CONFIGURED STATUS_JSON_NAME _ <<<"$out"
   return 0
 }
 STATUS_VERSION=""
@@ -2401,7 +2444,7 @@ ip_list() {     # az eszköz globális IPv4-címei, soronként
 
 summary() {
   local -a ips=() rows=()
-  local ip hn first="" l
+  local hn first="" l
   while IFS= read -r l; do [[ -n $l ]] && ips+=("$l"); done < <(ip_list)
   hn="$(hostname)"; [[ -n $MAC ]] || MAC="$(primary_mac)"
   first=${ips[0]:-}
@@ -2509,7 +2552,7 @@ parse_args() {
   if [[ -n $FROM ]]; then
     case $FROM in
       http://*|https://*) FROM_MODE=url; CURL_SEC=(--proto '=http,https') ;;
-      *) FROM_MODE=file ;;
+      *) FROM_MODE="file" ;;
     esac
   fi
 }
@@ -2576,6 +2619,7 @@ main() {
   local lockdir=$WORK
   if (( ! CHECK )); then
     # a letöltés és az állapot a felhasználó saját (0700-as) mappájában él, hogy megszakadás után folytatható legyen; a --check ide sem ír
+    # shellcheck disable=SC2174  # (szándékos: a szülők alapjogosultsággal jönnek létre, csak a $CACHE lesz 0700)
     mkdir -p -m 700 -- "$CACHE" || { printf 'Nem hozható létre a munkamappa: %s\n' "$CACHE" >&2; exit 1; }
     chmod 700 -- "$CACHE"            # meglévő mappánál is: a letöltés és az állapot csak a felhasználóé
     lockdir=$CACHE; STATE_FILE="$CACHE/state"
@@ -2592,7 +2636,10 @@ main() {
   if [[ -n $STATE_FILE && -f $STATE_FILE ]]; then
     local k v st="" sn="" snm=""
     while IFS='=' read -r k v; do case $k in status) st=$v;; step) sn=$v;; name) snm=$v;; esac; done <"$STATE_FILE"
-    if [[ $st == running || $st == failed ]]; then ui_info "Folytatás: az előző futás a(z) ${sn:-?}. lépésnél (${snm:-?}) megszakadt – folytatom (az ellenőrzött letöltés újrahasznosul)."; fi
+    if [[ $st == running || $st == failed ]]; then
+      PREV_STEP=$sn
+      ui_info "Folytatás: az előző futás a(z) ${sn:-?}. lépésnél (${snm:-?}) megszakadt – folytatom (az ellenőrzött letöltés újrahasznosul)."
+    fi
   fi
 
   step_preflight
@@ -2612,7 +2659,7 @@ main() {
   summary
   # a véletlen jelszó mostantól „megmutatott”: ha ezután újrafuttatják, már nem cseréljük
   if [[ $OS_PW_MODE == random-applied ]]; then mark_os_password random; fi
-  state_write done
+  state_write "done"
   flush_log || true
   # siker: a letöltött csomag és a kicsomagolt fa már nem kell (csak a saját, ismert nevű elemeket töröljük); a titkok törlése
   rm -rf -- "${CACHE:?}/tree" "${CACHE:?}"/release-* "${CACHE:?}"/from-*
