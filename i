@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2178,SC2128,SC2155,SC2209,SC2174,SC1010
+# shellcheck disable=SC2034,SC2178,SC2128,SC2155,SC2209,SC2174,SC1010   # szándékos: használaton kívüli sorolt változók, tömb-/szövegváltozó azonos névvel, 'done' szó argumentumként; lásd tools/publish-installer.sh
 # =====================================================================================================================
 # Kirakat – EGYPARANCSOS TELEPÍTŐ (ODROID-M2, Hardkernel Ubuntu 26.04)
 #
-#   curl -sL https://gamekiller168.github.io/i | bash            # a friss ODROID-on, az odroid felhasználóval
-#   curl -sL https://gamekiller168.github.io/i | bash -s -- --check    # csak ellenőrzés + terv, semmit nem változtat
+#   curl -fsSL https://gamekiller168.github.io/i | bash            # a friss ODROID-on, az odroid felhasználóval
+#   curl -fsSL https://gamekiller168.github.io/i | bash -s -- --check    # csak ellenőrzés + terv, semmit nem változtat
 #
 # Mit csinál: letölti a legfrissebb kiadást, majd fölteszi a teljes rendszert (csomagok, lejátszó-kiosk, szerver, OTA-frissítő,
 # rendszerjelszó), és a végén a kijelzőn megjelenik a QR-kód + a beállítási kód. Egyetlen JELSZÓT kér: a sudo-jelszót.
@@ -28,7 +28,7 @@
 # Biztonság: a telepítő NEM rootként fut (a sudo-t maga hívja), a letöltés privát (0700) mappába megy, a csomag minden bejegyzését
 # kicsomagolás előtt ellenőrzi, a GitHub-token csak az api.github.com felé megy, fájlból (-H @fájl), sosem parancssorban,
 # naplóban vagy a környezetben; átirányítást csak github.com / *.githubusercontent.com felé követ, token nélkül.
-# Fontos: a teljes szkript egyetlen `main "$@"` hívással indul az utolsó sorban – egy megszakadt letöltésből semmi sem fut le.
+# Fontos: a teljes szkript egyetlen `main "$@" --kirakat-script-end` hívással indul az utolsó sorban – egy megszakadt letöltésből semmi sem fut le (a záró jelző nélkül a main nem indul).
 #
 # ELTÉRÉS A TERVTŐL (szándékos): a telepítő NEM olvassa ki és NEM írja ki a beállítási kódot. A szerver (server/kiosk.py) azt csak a fizikai kijelzőnek
 # (a kioszk böngészőjének) adja ki, hogy hálózati kliens ne tudja megszerezni; a kód így csak a HDMI-kijelzőn látszik. A telepítő a lejátszó (systemd) stabil
@@ -36,6 +36,8 @@
 #
 # A KIRAKAT_* és SIGNAGE_* környezeti változók csak teszteléshez valók (útvonalak felülírása); éles használatnál ne állítsd őket.
 # =====================================================================================================================
+# `| sh` (Ubuntu-n a dash) esetén ez az első parancs fut le (POSIX-szintaxis), még mielőtt a bash-specifikus részek értelmezésére kerülne sor: érthető üzenet a cryptikus hiba helyett
+if [ -z "${BASH_VERSION:-}" ]; then echo "Ez a telepítő bash-t igényel: a parancs végén '| bash' álljon (nem '| sh')." >&2; exit 1; fi
 set -Eeuo pipefail
 shopt -s extglob
 umask 022
@@ -60,8 +62,7 @@ OS_RELEASE_FILE="${KIRAKAT_OS_RELEASE:-/etc/os-release}"
 MEMINFO_FILE="${KIRAKAT_MEMINFO:-/proc/meminfo}"
 MIN_FREE_KB="${KIRAKAT_MIN_FREE_KB:-4194304}"          # 4 GiB
 MIN_RAM_KB=3000000
-MIN_YEAR=2026                                            # ennél korábbi évszám = rossz óra (a telepítő ebben az évben készült)
-MIN_EPOCH=1790812800                                     # 2026-10-01 00:00 UTC: a telepítő készülte; ennél korábbi „GitHub-idő” nem hihető
+MIN_EPOCH="${KIRAKAT_MIN_EPOCH:-1790812800}"                  # 2026-10-01 00:00 UTC: a telepítő készülte; ennél korábbi óra / „GitHub-idő” nem hihető (az env csak teszteléshez)
 MAX_CLOCK_AHEAD=$((12 * 365 * 86400))                    # a (tényleg rossz) órát legfeljebb ennyivel a telepítő készülte után állítjuk be (hitelesítetlen forrásnál)
 MAX_CLOCK_STEP=$((2 * 86400))                            # hitelesítetlen forrásnál, ha a helyi óra hihető: legfeljebb ekkora eltérést fogadunk el
 MAX_DOWNLOAD=$((300 * 1024 * 1024))
@@ -85,9 +86,9 @@ CHECK=0; YES=0; NO_PLAYER=0; KEEP_OS_PW=0; NO_COLOR_FLAG=0
 APP_USER=""; APP_GROUP=""; APP_UID=""
 WORK=""; WORK_LOG=""; LOG_FLUSHED=0; CACHE=""; TREE=""
 SECRETS=""; RT_DIR=""; STAGE=""; RTREE=""; VERIFIED_SHA=""; SUDO_FRESH=0; RUNNING_VERSION=""; HAVE_NET_HOOK=0
-HAVE_TTY=0; IS_TTY=0; COLOR=0; UNI=0; COLS=80; COMPACT=0
+HAVE_TTY=0; IS_TTY=0; LIVE=0; COLOR=0; UNI=0; COLS=80; COMPACT=0
 STEP_N=0; STEP_NAME=""; STEP_T0=0; RUN_T0=$SECONDS
-INTERRUPTED=0; SIGNAME=""; FAIL_CAUSE=""; FAIL_TODO=""; IN_EXIT=0; SUDO_OK=0
+INTERRUPTED=0; SIGNAME=""; FAIL_CAUSE=""; FAIL_TODO=""; IN_EXIT=0; SUDO_OK=0; OS_PW_APPLIED=0
 KEEPALIVE_PID=""; MAIN_PID=$$; LOCK_PID=""
 AUTH_HDR=""; TOKEN_FILE_OUT=""; KEY_FILE=""; HAVE_TOKEN=0; HAVE_KEY=0; PENDING_CODE=""
 CONSOLE_TTY=""; ON_TTY1=0; PLAYER_DEFERRED=0
@@ -114,7 +115,11 @@ def die(msg):
 
 
 auth_out, token_out, key_out = sys.argv[1:4]
-raw = re.sub(r"\s+", "", sys.stdin.read())
+# a beillesztésből: minden szóköz / sortörés / láthatatlan karakter (nem törhető szóköz, nulla szélességű szóköz, BOM) kiesik; a körülvevő idézőjel, zárójel és mondatvégi
+# írásjel, az `export KIRAKAT_CODE=` előtag leválik; a szabványos base64 (+ /) a URL-biztos (- _) alakra váltódik. A hosszt és az alakot ezután ellenőrizzük.
+raw = re.sub(r"[\s\u200b\u200c\u200d\u2060\ufeff]+", "", sys.stdin.read())
+raw = re.sub(r"^(?:export)?KIRAKAT_CODE=", "", raw)
+raw = raw.strip("\"'`<>()[]{}.,;:!?").replace("+", "-").replace("/", "_")
 if not re.fullmatch(r"[A-Za-z0-9_-]{20,2048}={0,2}", raw):
     die("a telepítőkód alakja hibás (hiányos vagy elcsúszott beillesztés?)")
 body = raw.rstrip("=")
@@ -365,6 +370,8 @@ LOGO
 
 ui_init() {
   [[ -t 1 ]] && IS_TTY=1 || IS_TTY=0
+  # élő (újrarajzolt) sor csak olyan terminálon, amely érti a vezérlősorozatokat: a TERM=dumb (vagy üres TERM) terminálon az ESC[K szemétként látszana → sima, soronkénti kimenet
+  LIVE=0; if (( IS_TTY )) && [[ -n ${TERM:-} && ${TERM:-} != dumb ]]; then LIVE=1; fi
   if (( IS_TTY )) && [[ -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb && $NO_COLOR_FLAG == 0 ]]; then COLOR=1; fi
   if (( COLOR )); then
     C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_BAD=$'\033[31m'; C_HDR=$'\033[1;36m'
@@ -401,10 +408,10 @@ ui_fit() {      # $1 szöveg, $2 legnagyobb szélesség → a szöveg, szükség
   if (( ${#s} > w )); then printf '%s' "${s:0:w-1}$G_ELL"; else printf '%s' "$s"; fi
 }
 
-ui_live_clear() { if (( IS_TTY && LIVE_ON )); then printf '\r\033[K'; LIVE_ON=0; fi; return 0; }
+ui_live_clear() { if (( LIVE && LIVE_ON )); then printf '\r\033[K'; LIVE_ON=0; fi; return 0; }
 ui_emit() { ui_live_clear; printf '%s\n' "$1"; }
 ui_live() {     # $1 szöveg (egy sor, a végén nincs újsor; csak terminálon, és nem keskeny terminálon)
-  (( IS_TTY && ! COMPACT )) || return 0
+  (( LIVE && ! COMPACT )) || return 0
   printf '\r\033[K  %s' "$(ui_fit "$1" $((COLS - 3)))"
   LIVE_ON=1
 }
@@ -483,29 +490,42 @@ ui_bar() {      # $1 százalék (0–100; -1 = ismeretlen), $2 teljes szélessé
   BAR+="]"
 }
 
-PROG_LAST_MS=-1; PROG_LAST_PRINT=0
-ui_progress() { # $1 címke, $2 százalék (-1 = ismeretlen), $3 jobb oldali szöveg (méret, sebesség, hátralévő idő)
-  local label=$1 pct=$2 right=$3 bw pcts spin lab pad
+PROG_LAST_MS=-1; PROG_LAST_PRINT=0; PROG_SHORT=""; PROG_SPEED=""
+ui_progress() { # $1 címke, $2 százalék (-1 = ismeretlen), $3 jobb oldali szöveg (méret, sebesség, hátralévő idő); PROG_SHORT: ennek rövidebb változata (keskeny terminálra)
+  local label=$1 pct=$2 right=$3 bw pcts spin lab pad avail
   TICK=$((TICK + 1))
-  if (( ! IS_TTY || COMPACT )); then
-    # nem terminál (vagy keskeny terminál): nincs újrarajzolás; csak ~10%-onként (vagy 5 mp-enként, ha a teljes méret ismeretlen) egy teljes sor
-    local step=-1 now=$SECONDS
+  if (( ! LIVE || COMPACT )); then
+    # nem terminál (vagy dumb / keskeny terminál): nincs újrarajzolás; csak ~10%-onként (vagy 5 mp-enként, ha a teljes méret ismeretlen) egy teljes sor
+    local step=-1 now=$SECONDS line
     if (( pct >= 0 )); then step=$(( pct / 10 )); if (( step > PROG_LAST_MS )); then PROG_LAST_MS=$step; else return 0; fi
     elif (( now - PROG_LAST_PRINT < 5 && PROG_LAST_PRINT != 0 )); then return 0; fi
     PROG_LAST_PRINT=$now
     if (( pct >= 0 )); then printf -v pcts '%3d%%' "$pct"; else pcts=' ...'; fi
     if (( COMPACT )); then ui_emit "$(ui_fit "    $label $pcts $right" $((COLS - 1)))"; return 0; fi
-    ui_bar "$pct" 30
-    printf '    %s %s  %s  %s\n' "$label" "$BAR" "$pcts" "$right"
+    bw=30
+    if (( IS_TTY )); then      # terminálon a sor a szélességhez igazodik: előbb a sáv szűkül, aztán a jobb oldali szöveg rövidül
+      avail=$(( COLS - 2 - (4 + ${#label} + 1 + 2 + 4 + 2) ))
+      if (( avail - ${#right} >= 10 )); then bw=$(( avail - ${#right} )); (( bw > 30 )) && bw=30
+      elif [[ -n $PROG_SHORT ]] && (( avail - ${#PROG_SHORT} >= 10 )); then right=$PROG_SHORT; bw=$(( avail - ${#right} )); (( bw > 30 )) && bw=30
+      else right=$(ui_fit "$right" $(( avail > 20 ? avail - 10 : 10 ))); bw=10; fi
+    fi
+    ui_bar "$pct" "$bw"
+    line="    $label $BAR  $pcts  $right"
+    if (( IS_TTY )); then line=$(ui_fit "$line" $((COLS - 1))); fi
+    ui_emit "$line"
     return 0
   fi
   spin=${SPIN[$((TICK % SPIN_N))]}
   if (( pct >= 0 )); then printf -v pcts '%3d%%' "$pct"; else pcts='  ~ '; fi
-  # a sáv szélessége állandó (a jobb oldali szöveg hossza ingadozik): nincs ugrálás / villogás
+  # a sáv szélessége állandó (a jobb oldali szöveg hossza ingadozik): nincs ugrálás / villogás. A sor: 2 + pörgettyű + 1 + címke(10) + 1 + sáv + 1 + százalék(4) + 2 + jobb oldali szöveg
   lab=$(ui_fit "$label" 10)
   printf -v pad '%*s' $(( 10 - ${#lab} )) ''
-  bw=$(( COLS - 1 - (3 + 10 + 2 + 2 + 4 + 2) - 44 ))
-  if (( bw < 12 )); then right=""; bw=$(( COLS - 1 - (3 + 10 + 2 + 2 + 4 + 2) )); fi
+  avail=$(( COLS - 2 - 22 ))
+  if (( avail - 44 >= 12 )); then bw=$(( avail - 44 )); right=$(ui_fit "$right" 44)
+  elif [[ -n $PROG_SHORT ]] && (( avail - 22 >= 10 )); then right=$(ui_fit "$PROG_SHORT" 22); bw=$(( avail - 22 ))
+  elif [[ -n $PROG_SPEED ]] && (( avail - 11 >= 10 )); then right=$PROG_SPEED; bw=$(( avail - 11 ))
+  elif [[ -z $PROG_SHORT ]] && (( avail - 16 >= 10 )); then right=$(ui_fit "$right" 16); bw=$(( avail - 16 ))
+  else right=""; bw=$avail; fi
   if (( bw < 10 )); then bw=10; fi
   if (( bw > 40 )); then bw=40; fi
   ui_bar "$pct" "$bw"
@@ -580,7 +600,8 @@ flush_log() {
 }
 
 STATE_FILE=""
-state_write() { [[ -n $STATE_FILE ]] || return 0; printf 'status=%s\nstep=%s\nname=%s\ntag=%s\n' "$1" "$STEP_N" "$STEP_NAME" "$TAG" >"$STATE_FILE" 2>/dev/null || true; }
+# (a kapcsos blokk kell: egy sikertelen `>fájl` átirányítás hibaüzenetét a bash még az utána álló `2>/dev/null` érvénybe lépése előtt kiírná – pl. ha a siker után törölt gyorsítótár-mappába írna)
+state_write() { [[ -n $STATE_FILE ]] || return 0; { printf 'status=%s\nstep=%s\nname=%s\ntag=%s\n' "$1" "$STEP_N" "$STEP_NAME" "$TAG" >"$STATE_FILE"; } 2>/dev/null || true; }
 
 wipe_secrets() {   # a titkos munkafájlok biztonságos törlése és a memóriában tartott jelszó nullázása
   local f
@@ -650,13 +671,14 @@ on_exit() {
   if [[ -n $KEEPALIVE_PID ]]; then kill_tree "$KEEPALIVE_PID" TERM; fi
   cleanup_children
   ui_live_clear
-  if (( IS_TTY )); then printf '\033[?25h'; fi
+  if (( LIVE )); then printf '\033[?25h'; fi
   if (( HAVE_TTY )); then stty echo </dev/tty 2>/dev/null; fi
   if (( INTERRUPTED )); then
     FAIL_CAUSE="megszakítva (${SIGNAME:-jel})"
     ui_emit ""
     ui_text 2 "${C_WARN}${G_WARN} " "  " "" "Megszakítva. A rendszer konzisztens állapotban maradt: félig megírt fájl nem maradt."
     if [[ -n $RANDOM_PW && $OS_PW_MODE == random-applied ]]; then show_random_pw; fi
+    show_derived_pw_note
     ui_text 2 "  " "  " "" "Futtasd újra ugyanazt a parancsot: folytatja ott, ahol abbahagyta."
   elif (( rc != 0 )); then
     show_failure "$rc"
@@ -712,8 +734,16 @@ show_failure() {
     done < <(tail -n 25 "$WORK_LOG")
   fi
   if [[ -n $RANDOM_PW && $OS_PW_MODE == random-applied ]]; then show_random_pw; fi
+  show_derived_pw_note
   ui_emit ""
   ui_text 2 "  " "  " "$C_B" "Futtasd újra ugyanazt a parancsot: folytatja."
+}
+
+# A MAC-ból számolt jelszó már érvényes, de a telepítés nem ért végig: az újrafuttatás sudo-jelszava ez (a gyári már nem) – e nélkül a gazda a gyári jelszóval próbálkozna, és kizárná magát.
+show_derived_pw_note() {
+  [[ $OS_PW_MODE == derived && $OS_PW_APPLIED == 1 ]] || return 0
+  ui_emit ""
+  ui_text 4 "  ${C_WARN}${G_WARN}${C_RST} " "    " "" "A rendszerjelszó már a MAC-címből számolt jelszóra cserélődött (PC-n: tools/os-password.py derive --mac ${MAC:-<MAC>}) – az újrafuttatáskor a sudo-jelszó ez, a gyári már nem érvényes."
 }
 
 # A már beállított, de az összegzésben még meg nem mutatott véletlen jelszó (megszakításkor / hibakor ez az egyetlen esély, hogy lássa a gazda).
@@ -724,16 +754,19 @@ show_random_pw() {
 }
 
 # A napló végéből felismert gyakori okok → egyszerű magyar magyarázat és teendő
+EXPLAIN_FROM=0          # az újrapróbálás után csak az újabb naplósorokból következtetünk (a régi „lock” hiba ne magyarázza a következőt)
 explain_from_log() {
   [[ -s $WORK_LOG ]] || return 0
-  local t; t="$(tail -n 80 "$WORK_LOG")"
+  local t; t="$(tail -n +$((EXPLAIN_FROM + 1)) "$WORK_LOG" | tail -n 80)"
   case $t in
-    *"No space left on device"*|*"Disk quota exceeded"*) FAIL_CAUSE="megtelt a lemez"; FAIL_TODO="Szabadíts fel helyet (df -h mutatja), majd futtasd újra ugyanazt a parancsot." ;;
+    *"No space left on device"*|*"Disk quota exceeded"*|*"don't have enough free space"*) FAIL_CAUSE="megtelt a lemez"; FAIL_TODO="Szabadíts fel helyet (df -h mutatja), majd futtasd újra ugyanazt a parancsot." ;;
     *"Could not get lock"*|*"Unable to acquire the dpkg frontend lock"*|*"Could not open lock file"*) FAIL_CAUSE="egy másik csomagkezelő (apt/dpkg, pl. automatikus frissítés) még fut"; FAIL_TODO="Várj 5–10 percet, majd futtasd újra ugyanazt a parancsot." ;;
+    *"is not valid yet"*|*"az óra nincs szinkronban"*) FAIL_CAUSE="az óra késik vagy nincs szinkronban (a kimenő NTP nem működik, és nincs megbízható időforrás)"; FAIL_TODO="Állítsd be az órát pontosan (sudo date -s 'ÉÉÉÉ-HH-NN ÓÓ:PP:MM'), vagy kérd meg az IT-t, hogy engedélyezze az UDP 123-at (NTP); majd futtasd újra ugyanazt a parancsot." ;;
     *"Temporary failure resolving"*|*"Could not resolve"*|*"Name or service not known"*) FAIL_CAUSE="a névfeloldás (DNS) nem működik"; FAIL_TODO="Ellenőrizd a hálózati kábelt és a DHCP/DNS beállítást (kérd meg az IT-t), majd futtasd újra." ;;
     *"Failed to fetch"*|*"Unable to connect"*|*"Connection timed out"*|*"Connection failed"*|*"Could not connect"*) FAIL_CAUSE="a csomagtár (apt) nem érhető el a hálózaton"; FAIL_TODO="Kérd meg az IT-t: 443-as (HTTPS) kimenő forgalom a csomagtárakhoz (az /etc/apt forrásaiban szereplő gazdagépek: pl. ports.ubuntu.com, archive.ubuntu.com, security.ubuntu.com és a Hardkernel tára), majd futtasd újra." ;;
     *"Hash Sum mismatch"*|*"GPG error"*|*"NO_PUBKEY"*) FAIL_CAUSE="a csomagtár tartalma nem hiteles (hash/aláírás hiba)"; FAIL_TODO="Ellenőrizd az órát (date), várj pár percet, majd futtasd újra." ;;
     *"dpkg was interrupted"*|*"dpkg: error processing"*) FAIL_CAUSE="egy korábbi csomagtelepítés félbemaradt"; FAIL_TODO="Futtasd újra ugyanazt a parancsot: a telepítő rendbe teszi (dpkg --configure -a)." ;;
+    *"Unable to locate package"*|*"has no installation candidate"*) FAIL_CAUSE="egy szükséges csomag nem található a csomagtárakban (valószínűleg egy csomagtár – pl. a Hardkernel tára – nem érhető el, vagy hiányos a forráslista)"; FAIL_TODO="Kérd meg az IT-t a csomagtárak (Ubuntu, Hardkernel) elérésére; a napló elején látszik, melyik tár hibázott. Ha kész, futtasd újra ugyanazt a parancsot." ;;
     *"Permission denied"*) FAIL_CAUSE="jogosultsági hiba"; FAIL_TODO="Futtasd újra a parancsot az odroid felhasználóval (nem rootként), és add meg a sudo-jelszót." ;;
   esac
 }
@@ -774,16 +807,30 @@ free_kb_of() {  # a legközelebbi létező szülőmappát tartalmazó fájlrends
   printf '%s' "${f[3]:-0}"
 }
 
-primary_mac() { # az alapértelmezett útvonal csatolójának MAC-je (mint a server/ospasswd.py primary_mac), kisbetűs, kettőspontos
-  local ifc="" l m="" i
-  local -a w
-  l="$(ip route show default 2>/dev/null | head -n 1 || true)"
-  read -ra w <<<"$l"
-  for i in "${!w[@]}"; do if [[ ${w[$i]} == dev ]]; then ifc=${w[$((i + 1))]:-}; break; fi; done
-  [[ $ifc =~ ^[A-Za-z0-9_.:-]+$ ]] || ifc=eth0
-  [[ -r $SYS_NET/$ifc/address ]] || ifc=eth0
-  if [[ -r $SYS_NET/$ifc/address ]]; then read -r m <"$SYS_NET/$ifc/address" || true; fi
-  printf '%s' "${m,,}"
+primary_mac() { # ugyanazt a csatolót választja, mint a server/ospasswd.py primary_mac: a legkisebb metrikájú alapértelmezett útvonal csatolója, utána bármely más (nem lo) csatoló névsorrendben;
+                # kisbetűs, kettőspontos MAC; ha egyik sem olvasható (vagy csupa nulla), nem ír ki semmit. (A jelszó a MAC-ből számolódik: a telepítőnek és a szervernek ugyanazt kell látnia.)
+  local l m="" iface="" best="" dev metric i ifc name
+  local -a w cands=()
+  while IFS= read -r l; do
+    read -ra w <<<"$l"; dev=""; metric=0
+    for i in "${!w[@]}"; do
+      case ${w[$i]} in dev) dev=${w[$((i + 1))]:-} ;; metric) metric=${w[$((i + 1))]:-0} ;; esac
+    done
+    [[ $dev =~ ^[A-Za-z0-9_.:-]{1,32}$ && $metric =~ ^[0-9]+$ ]] || continue
+    if [[ -z $best ]] || (( metric < best )); then best=$metric; iface=$dev; fi
+  done < <(ip route show default 2>/dev/null || true)
+  if [[ -n $iface ]]; then cands+=("$iface"); fi
+  for name in "$SYS_NET"/*; do
+    name=${name##*/}
+    if [[ $name != lo && $name != "$iface" && $name != '*' ]]; then cands+=("$name"); fi
+  done
+  for ifc in "${cands[@]}"; do
+    [[ $ifc =~ ^[A-Za-z0-9_.:-]{1,32}$ && -r $SYS_NET/$ifc/address ]] || continue
+    m=""; read -r m <"$SYS_NET/$ifc/address" || true
+    m=${m,,}
+    if [[ $m =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ && $m != 00:00:00:00:00:00 ]]; then printf '%s' "$m"; return 0; fi
+  done
+  return 0
 }
 
 # --- terminál-bemenet (a parancs `curl | bash`-ből jön, ezért minden kérdés a /dev/tty-ról olvas) ---
@@ -792,10 +839,19 @@ detect_tty() { if { : </dev/tty; } 2>/dev/null; then HAVE_TTY=1; else HAVE_TTY=0
 prompt_hidden() {   # $1 kérdés → PROMPT_REPLY (szóközök nélkül); 1, ha nincs terminál
   PROMPT_REPLY=""
   (( HAVE_TTY )) || return 1
+  local more=""
   printf '%s' "$1" >/dev/tty
   IFS= read -r -s PROMPT_REPLY </dev/tty || true
+  # egy több sorba tört beillesztés (pl. e-mailből) további sorai már a terminál pufferében vannak: hozzáfűzzük, különben a következő kérdés kapná meg, vagy a shell futtatná
+  while IFS= read -r -s -t 0.2 more </dev/tty; do PROMPT_REPLY+=$more; done
   printf '\n' >/dev/tty
   PROMPT_REPLY=${PROMPT_REPLY//[[:space:]]/}
+}
+
+drain_tty() {       # a pufferben maradt bemenet eldobása (egy beillesztés maradéka ne válaszolhasson egy későbbi kérdésre)
+  (( HAVE_TTY )) || return 0
+  while IFS= read -r -s -t 0.05 -n 4096 _ </dev/tty; do :; done
+  return 0
 }
 
 # Egyetlen példány: a zárat egy külön „tartó” folyamat fogja (flock), amely a telepítő kilépésével magától megszűnik. (Ha a zárfájl leírója a gyerekfolyamatokban is nyitva
@@ -823,10 +879,31 @@ need_sudo() {
   fi
   ui_info "A sudo jelszavát kérem (ez az egyetlen jelszó, amit a telepítés kér)."
   ui_live_clear
-  if ! sudo -v -p "A(z) %p felhasználó jelszava (sudo): " </dev/tty; then
-    fail "a sudo nem fogadta el a jelszót, vagy a(z) $APP_USER felhasználó nem használhat sudo-t" "Futtasd újra a parancsot, és gépeld be pontosan az odroid felhasználó jelszavát (a gépelés közben nem látszik semmi)."
+  # (a háttérben fut, mi a `wait`-en várunk: csak a `wait` szakítható meg azonnal egy jellel – egy előtérben várakozó sudo mellett a TERM / HUP a jelszó beírásáig késne)
+  local sudo_pid sudo_rc=0
+  sudo -v -p "A(z) %p felhasználó jelszava (sudo): " </dev/tty &
+  sudo_pid=$!
+  wait "$sudo_pid" || sudo_rc=$?
+  if (( sudo_rc != 0 )); then
+    # egy korábbi (megszakadt vagy lefutott) telepítés már lecserélhette a gyári jelszót: a gazda ilyenkor a gyárival próbálkozna, hiába
+    local prevpw="" hint=""
+    if [[ -r $INSTALL_STATE_DIR/os-password ]]; then read -r prevpw <"$INSTALL_STATE_DIR/os-password" || prevpw=""; fi
+    case " $(id -nG 2>/dev/null) " in
+      *" sudo "*|*" admin "*|*" wheel "*) ;;
+      *) hint=" A(z) $APP_USER felhasználó nincs a sudo csoportban: a telepítést az odroid felhasználóval kell futtatni (lépj be vele)." ;;
+    esac
+    case $prevpw in
+      derived|derived-pending) hint=" Ha ezen az eszközön a telepítő már lefutott (vagy megszakadt), a rendszerjelszó a MAC-címből számolt jelszó, a gyári már nem érvényes (PC-n: tools/os-password.py derive --mac $(primary_mac))." ;;
+      random|random-unconfirmed) hint=" Ha ezen az eszközön a telepítő már lefutott (vagy megszakadt), a rendszerjelszó a telepítő által kiírt véletlen jelszó, a gyári már nem érvényes." ;;
+    esac
+    fail "a sudo nem fogadta el a jelszót, vagy a(z) $APP_USER felhasználó nem használhat sudo-t" "Futtasd újra a parancsot, és gépeld be pontosan az odroid felhasználó jelszavát (a gépelés közben nem látszik semmi).$hint"
   fi
   SUDO_OK=1; SUDO_FRESH=1
+  # a telepítő a sudo-jegyre támaszkodik (egyetlen jelszó, utána `sudo -n`): ha a sudo nem jegyez (pl. `Defaults timestamp_timeout=0`), minden további lépés félrevezető hibával bukna
+  if ! sudo -n true 2>/dev/null; then
+    SUDO_OK=0
+    fail "a sudo nem jegyzi meg a jelszót (a sudoers szerint a jegy azonnal lejár: timestamp_timeout=0), a telepítő így nem tud dolgozni" "Állítsd be a sudoers-ben a jegy érvényességét (Defaults timestamp_timeout=15), vagy adj az odroid felhasználónak a telepítés idejére jelszó nélküli sudo-t (NOPASSWD), majd futtasd újra a parancsot."
+  fi
   ui_ok "sudo: rendben (a telepítés végéig érvényben tartom, utána érvénytelenítem)"
   start_keepalive
 }
@@ -944,27 +1021,33 @@ dl_monitor() {  # $1 curl-pid, $2 fájl, $3 fejléc-fájl, $4 címke, $5 várt m
       pct=$(( size * 100 / total )); if (( pct > 99 )); then pct=99; fi
       eta=""; if (( speed > 0 )); then eta=" ETA $(fmt_dur $(( (total - size) / speed )))"; fi
       right="$(fmt_bytes "$size") / $(fmt_bytes "$total")  $(fmt_bytes "$speed")/s$eta"
+      PROG_SHORT="$(fmt_bytes "$speed")/s$eta"
     else
       pct=-1
       right="$(fmt_bytes "$size")  $(fmt_bytes "$speed")/s"
+      PROG_SHORT="$(fmt_bytes "$speed")/s"
     fi
+    PROG_SPEED="$(fmt_bytes "$speed")/s"
     # átirányítási (üres) lépésnél nincs mit mutatni: a sáv az első adat megérkezésekor jelenik meg
     if (( size > 0 )); then ui_progress "$label" "$pct" "$right"; fi
     sleep 0.2
   done
+  PROG_SHORT=""; PROG_SPEED=""
   # záró sor (a kész állapot): a teljes méret és az átlagsebesség
   file_size "$f"; size=$FSIZE
   now_ms; i=$(( NOW_MS - t0 )); (( i < 1 )) && i=1
   avg=$(( size * 1000 / i ))
-  if (( IS_TTY )); then ui_live_clear; fi
+  ui_live_clear
   if (( size > 0 )); then
     local tail_txt="100%  $(fmt_bytes "$size")  átlag $(fmt_bytes "$avg")/s  ($(fmt_dur $(( i / 1000 ))))" bw
     if (( COMPACT )); then
       ui_text 4 "    " "      " "" "$label kész: $(fmt_bytes "$size"), átlag $(fmt_bytes "$avg")/s ($(fmt_dur $(( i / 1000 ))))"
     else
-      bw=$(( COLS - 6 - ${#label} - ${#tail_txt} - 2 )); if (( bw > 30 )); then bw=30; fi; if (( bw < 10 )); then bw=10; fi
-      ui_bar 100 "$bw"
-      ui_emit "    $label $BAR $tail_txt"
+      # a sor szélességhez igazodik (keskeny terminálon előbb a sáv szűkül, aztán a szöveg rövidül, végül a sáv elmarad)
+      bw=$(( COLS - 2 - 4 - ${#label} - 1 - 1 - ${#tail_txt} )); if (( bw > 30 )); then bw=30; fi
+      if (( bw < 10 )); then tail_txt="100%  $(fmt_bytes "$size")  $(fmt_bytes "$avg")/s  ($(fmt_dur $(( i / 1000 ))))"; bw=$(( COLS - 2 - 4 - ${#label} - 1 - 1 - ${#tail_txt} )); if (( bw > 30 )); then bw=30; fi; fi
+      if (( bw >= 10 )); then ui_bar 100 "$bw"; ui_emit "    $label $BAR $tail_txt"
+      else ui_text 4 "    " "      " "" "$label kész: $(fmt_bytes "$size"), átlag $(fmt_bytes "$avg")/s ($(fmt_dur $(( i / 1000 ))))"; fi
     fi
     log "letöltve: $size bájt, átlag $avg B/s"
   fi
@@ -973,7 +1056,7 @@ dl_monitor() {  # $1 curl-pid, $2 fájl, $3 fejléc-fájl, $4 címke, $5 várt m
 # =====================================================================================================================
 # 1. lépés – előellenőrzés
 # =====================================================================================================================
-NET_FAILS=(); CLOCK_SUSPECT=0
+NET_FAILS=(); CLOCK_SUSPECT=0; HARD_RCS=()
 probe_https() {   # $1 gazdagép → 0 elérhető; egyébként PROBE_RC; a Date fejléc a $WORK/probe.hdr-ben
   local rc=0 code pid
   : >"$WORK/probe.code"
@@ -988,12 +1071,21 @@ probe_https() {   # $1 gazdagép → 0 elérhető; egyébként PROBE_RC; a Date 
   return 1
 }
 
+# Ha a környezetben proxy van beállítva (https_proxy …), a curl azon át kapcsolódik – hibánál ez a leggyakoribb, nem látszó ok. Kimenet: a jegyzet (vagy üres).
+proxy_note() {
+  local v p=""
+  for v in https_proxy HTTPS_PROXY all_proxy ALL_PROXY; do if [[ -n ${!v:-} ]]; then p=${!v}; break; fi; done
+  [[ -n $p ]] || return 0
+  p=${p#*://}; p=${p##*@}            # a címből a séma és az esetleges felhasználónév:jelszó kiesik (nem írjuk ki)
+  printf ' (a környezetben proxy van beállítva: %s – ha nem kell, töröld: unset https_proxy HTTPS_PROXY; ha kell, az IT adja meg a helyes címét)' "${p:0:60}"
+}
+
 explain_net() {   # $1 gazdagép $2 curl-kód → sor a hibalistába
   case $2 in
     6)  printf '%s' "$1: a név nem oldható fel (DNS) – ellenőrizd a hálózati kábelt és a DNS-t" ;;
-    7|28) printf '%s' "$1:443 nem érhető el – kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé" ;;
+    5|7|28|56) printf '%s%s' "$1:443 nem érhető el – kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé" "$(proxy_note)" ;;
     35|51|58|59|60|77|83) printf '%s' "$1: titkosítási (TLS) hiba – rossz óra, vagy a céges hálózat átvizsgálja a HTTPS-t" ;;
-    *)  printf '%s' "$1: a kapcsolat sikertelen (curl: $2) – kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé" ;;
+    *)  printf '%s%s' "$1: a kapcsolat sikertelen (curl: $2) – kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé" "$(proxy_note)" ;;
   esac
 }
 
@@ -1043,7 +1135,7 @@ step_preflight() {
 
 probe_network() {
   local h rc=0 f hh cc hard=0
-  NET_FAILS=(); CLOCK_SUSPECT=0
+  NET_FAILS=(); CLOCK_SUSPECT=0; HARD_RCS=()
   if [[ $FROM_MODE == file ]]; then
     ui_ok "hálózat: a csomag helyi fájlból jön, a GitHubot nem érem el"
     clock_check; probe_apt_hosts; return 0
@@ -1079,11 +1171,16 @@ probe_network() {
     hh=${f%%|*}; cc=${f##*|}
     case $cc in
       35|51|58|59|60|77|83) ui_warn "$(explain_net "$hh" "$cc")$([[ $CLOCK_SUSPECT == 1 ]] && echo ' (az óra javítása után újrapróbálom)')" ;;
-      *) hard=1; ui_text 6 "    ${C_BAD}${G_BAD}${C_RST} " "      " "" "$(explain_net "$hh" "$cc")"; log "hálózati hiba: $hh curl=$cc" ;;
+      *) hard=1; HARD_RCS+=("$cc"); ui_text 6 "    ${C_BAD}${G_BAD}${C_RST} " "      " "" "$(explain_net "$hh" "$cc")"; log "hálózati hiba: $hh curl=$cc" ;;
     esac
   done
   if (( hard )); then
-    fail "a GitHub nem érhető el ebből a hálózatból" "Kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé (és codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com). Ha kész, futtasd újra ugyanazt a parancsot."
+    local only_dns=1 rc2
+    for rc2 in "${HARD_RCS[@]}"; do [[ $rc2 == 6 ]] || only_dns=0; done
+    if (( only_dns )); then
+      fail "a névfeloldás (DNS) nem működik: a GitHub címei nem oldhatók fel" "Ellenőrizd a hálózati kábelt, a DHCP-t és a DNS-beállítást (kérd meg az IT-t: a DNS-szerver oldja fel a github.com és api.github.com neveket), majd futtasd újra ugyanazt a parancsot."
+    fi
+    fail "a GitHub nem érhető el ebből a hálózatból$(proxy_note)" "Kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé (és codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com). Ha kész, futtasd újra ugyanazt a parancsot."
   fi
 }
 
@@ -1098,9 +1195,9 @@ HTTP_DATE_LOCAL=0
 
 # Az óra: ha az év kisebb a telepítő événél, vagy a HTTPS Date fejléc >60 mp-cel eltér és az NTP nem szinkronizált → a 2. lépésben beállítom.
 clock_check() {
-  local year drift ntp
-  year=$(printf '%(%Y)T' -1)
-  if (( year < MIN_YEAR )); then
+  local drift ntp now
+  now=$(printf '%(%s)T' -1)
+  if (( now < MIN_EPOCH )); then          # a telepítő MIN_EPOCH-kor készült: ennél korábbi óra biztosan rossz (a régi évszám-mérce a 2026. január–szeptemberi órát hihetőnek vette)
     if [[ -n $FROM_MODE ]]; then ui_warn "az óra rossz ($(printf '%(%F)T' -1)) – az apt hibázhat; állítsd be: sudo date -s 'YYYY-MM-DD HH:MM:SS'"
     else CLOCK_SUSPECT=1; ui_warn "az óra rossz ($(printf '%(%F)T' -1)) – a telepítés elején beállítom a GitHub idejére"; fi
   fi
@@ -1110,7 +1207,7 @@ clock_check() {
       ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)"
       if [[ $ntp != yes ]]; then CLOCK_SUSPECT=1; ui_warn "az óra ${drift} mp-cel eltér a GitHub idejétől, és nincs idő-szinkron – beállítom"
       else ui_warn "az óra ${drift} mp-cel eltér a GitHub idejétől (az idő-szinkron be van kapcsolva, nem nyúlok hozzá)"; fi
-    elif (( year >= MIN_YEAR )); then
+    elif (( now >= MIN_EPOCH )); then
       ui_ok "óra: rendben (eltérés a GitHub idejétől: ${drift} mp)"
     fi
   fi
@@ -1123,7 +1220,7 @@ clock_check() {
 # Az óra javítása (csak ha az 1. lépés gyanút jelzett). Két forrás:
 #  - ELLENŐRZÖTT: a TLS-en, érvényes tanúsítvánnyal kapott `Date:` fejléc (HTTP_DATE_EPOCH) – ezt az óra beállítására használjuk;
 #  - HITELESÍTETLEN: ha a TLS a rossz óra miatt nem megy, egyetlen `curl -k` fejléc-lekérdezés. Ezt egy közbeékelődő támadó (vagy egy HTTPS-t átvizsgáló proxy)
-#    tetszőlegesre hamisíthatja, ezért csak akkor használjuk, ha az óra tényleg rossz (év < MIN_YEAR) vagy az idő-szinkron nincs bekapcsolva, és csak ésszerű
+#    tetszőlegesre hamisíthatja, ezért csak akkor használjuk, ha az óra tényleg rossz (a telepítő készülte, MIN_EPOCH előtti) vagy az idő-szinkron nincs bekapcsolva, és csak ésszerű
 #    határokon belül (a telepítő készülte utáni legfeljebb 12 év; hihető helyi óránál legfeljebb 2 nap eltérés). Egyébként az órához NEM nyúlunk, és a TLS-hibát jelentjük.
 tls_interception_fail() {
   fail "titkosítási (TLS) hiba, pedig az óra rendben van – a céges hálózat valószínűleg átvizsgálja a HTTPS-t" "Kérd meg az IT-t: a github.com és az api.github.com legyen kivéve a HTTPS-átvizsgálás alól (vagy engedélyezett a közvetlen 443-as elérés). Az órához nem nyúltam; ha kész, futtasd újra ugyanazt a parancsot."
@@ -1131,12 +1228,13 @@ tls_interception_fail() {
 
 fix_clock() {
   if (( ! CLOCK_SUSPECT )); then return 0; fi
-  local d epoch="" year now ntp drift how h
-  year=$(printf '%(%Y)T' -1); now=$(printf '%(%s)T' -1)
+  local d epoch="" now ntp drift how h behind=0
+  now=$(printf '%(%s)T' -1)
+  if (( now < MIN_EPOCH )); then behind=1; fi            # biztosan rossz (a telepítő készülte előtti) óra
   if [[ -n $HTTP_DATE_EPOCH ]]; then
     epoch=$(( HTTP_DATE_EPOCH + now - HTTP_DATE_LOCAL ))      # a mérés óta eltelt idővel kiegészítve
     drift=$(( epoch - now )); if (( drift < 0 )); then drift=$(( -drift )); fi
-    if (( year >= MIN_YEAR && drift <= 60 )); then
+    if (( ! behind && drift <= 60 )); then
       # az óra rendben van: egy-két gazdagép TLS-hibája nem az órán múlik
       if (( ${#NET_FAILS[@]} )); then tls_interception_fail; fi
       return 0
@@ -1144,24 +1242,30 @@ fix_clock() {
     how="a GitHub idejére"
   else
     ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)"
-    if (( year >= MIN_YEAR )) && [[ $ntp == yes ]]; then tls_interception_fail; fi
+    if (( ! behind )) && [[ $ntp == yes ]]; then tls_interception_fail; fi
     # a TLS a rossz óra miatt nem működik: egyetlen, csak fejlécet olvasó kérés tanúsítvány-ellenőrzés nélkül; csak az időt vesszük át, ésszerűségi határokkal
     curl --proto '=https' --tlsv1.2 -k -sS -I -o /dev/null -D "$WORK/probe.hdr" --connect-timeout 8 --max-time 15 "https://$API_HOST/" 2>/dev/null </dev/null || true
     d="$(hdr_get "$WORK/probe.hdr" date)"
     if [[ -n $d ]]; then epoch="$(python3 -I -c "$PY_DATE" "$d" 2>/dev/null || true)"; fi
     [[ $epoch =~ ^[0-9]+$ ]] || fail "az óra rossz, és a GitHub idejét sem sikerült lekérdezni" "Állítsd be az órát kézzel (sudo date -s 'YYYY-MM-DD HH:MM:SS'), majd futtasd újra."
-    if (( year < MIN_YEAR )); then
+    if (( behind )); then
       (( epoch >= MIN_EPOCH && epoch <= MIN_EPOCH + MAX_CLOCK_AHEAD )) \
         || fail "a GitHubtól (hitelesítetlenül) kapott idő ($(printf '%(%F)T' "$epoch")) nem hihető" "Állítsd be az órát kézzel (sudo date -s 'YYYY-MM-DD HH:MM:SS'), majd futtasd újra."
     else
       drift=$(( epoch - now )); if (( drift < 0 )); then drift=$(( -drift )); fi
+      # az óra a hitelesítetlen idő szerint is rendben van: a TLS-hiba nem az órán múlik (átvizsgáló hálózat) – az órához nem nyúlunk
+      if (( drift <= 60 )); then tls_interception_fail; fi
       (( epoch >= MIN_EPOCH && drift <= MAX_CLOCK_STEP )) \
         || fail "a GitHubtól (hitelesítetlenül) kapott idő ($(printf '%(%F %T)T' "$epoch")) túl messze van a gép órájától – nem fogadom el" "Ellenőrizd az órát (date); ha rossz, állítsd be kézzel (sudo date -s 'YYYY-MM-DD HH:MM:SS'). Ha jó, a céges hálózat átvizsgálja a HTTPS-t: kérd meg az IT-t."
     fi
     how="a GitHub által HITELESÍTETLENÜL közölt időre (a TLS a rossz óra miatt nem ellenőrizhető; a kapott időt ésszerűségi határok közt fogadtam el)"
   fi
+  local before_set after_set
+  before_set=$(printf '%(%s)T' -1)
   if "${SUDO[@]}" date -u -s "@$epoch" >>"$WORK_LOG" 2>&1; then
     CLOCK_FIX_EPOCH=$epoch
+    # az óraugrás a bash $SECONDS-át is eltolja: a futási idők (lépésenként, összesen) ne legyenek negatívak vagy évszázadosak
+    after_set=$(printf '%(%s)T' -1); RUN_T0=$((RUN_T0 + after_set - before_set)); STEP_T0=$((STEP_T0 + after_set - before_set))
     ui_ok "óra beállítva ${how}: $(printf '%(%F %T)T' "$epoch") UTC"
     for h in "${NET_FAILS[@]}"; do
       probe_https "${h%%|*}" || fail "$(explain_net "${h%%|*}" "$PROBE_RC")" "Kérd meg az IT-t (443-as kimenő forgalom a github.com és api.github.com felé), majd futtasd újra."
@@ -1265,16 +1369,21 @@ api_error() {   # HTTP-kód alapján emberi hiba (kilép)
   esac
 }
 
-net_error() {   # curl-hiba alapján emberi hiba (kilép)
-  local rc=$FETCH_RC
+net_error() {   # curl-hiba alapján emberi hiba (kilép); $1 = download: a letöltés közbeni hiba (a 28-as kód ilyenkor lassú / megakadt kapcsolatot jelent)
+  local rc=$FETCH_RC ctx=${1:-}
   case $rc in
     6) fail "a névfeloldás (DNS) nem működik" "Ellenőrizd a hálózati kábelt és a DNS-t (kérd meg az IT-t), majd futtasd újra." ;;
-    7|28) fail "a GitHub nem érhető el (időtúllépés / kapcsolat megtagadva)" "Kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé; majd futtasd újra." ;;
+    28) if [[ $ctx == download ]]; then
+          fail "a letöltés túl lassú vagy megakadt (30 másodpercig alig jött adat, vagy 30 percnél tovább tartott)" "Ellenőrizd a hálózatot (kábel, IT-szűrő, nagy terhelés); futtasd újra ugyanazt a parancsot: új letöltést indít."
+        fi
+        fail "a GitHub nem érhető el (időtúllépés)$(proxy_note)" "Kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé; majd futtasd újra." ;;
+    5|7) fail "a GitHub nem érhető el (a kapcsolat megtagadva)$(proxy_note)" "Kérd meg az IT-t: 443-as kimenő forgalom a github.com és api.github.com felé; majd futtasd újra." ;;
+    18|52|55|56) fail "a letöltés sikertelen (a kapcsolat megszakadt, curl hibakód: $rc)$(proxy_note)" "Futtasd újra a parancsot: új letöltést indít; ha marad a hiba, ellenőrizd a hálózatot." ;;
     23) fail "a letöltött adat nem írható (megtelt a lemez?)" "Szabadíts fel helyet (df -h), majd futtasd újra ugyanazt a parancsot." ;;
     35|51|58|59|60|77|83) fail "titkosítási (TLS) hiba a GitHub felé" "Ellenőrizd az órát (date) és hogy a céges hálózat nem vizsgálja-e át a HTTPS-t; majd futtasd újra." ;;
     63) fail "a letöltés túl nagy (a megengedett határ fölött)" "Ez nem a szokásos csomag – ellenőrizd a kiadást, vagy kérdezd a fejlesztőt." ;;
     -1) fail "nem engedélyezett letöltési cím" "Ez hibát jelez a kiadásban – szólj a fejlesztőnek." ;;
-    *) fail "a letöltés sikertelen (curl hibakód: $rc)" "Futtasd újra a parancsot; ha marad a hiba, kérd meg az IT-t a 443-as kimenő forgalomról a github.com felé." ;;
+    *) fail "a letöltés sikertelen (curl hibakód: $rc)$(proxy_note)" "Futtasd újra a parancsot; ha marad a hiba, kérd meg az IT-t a 443-as kimenő forgalomról a github.com felé." ;;
   esac
 }
 
@@ -1472,12 +1581,12 @@ step_download() {
   if [[ $FROM_MODE == url ]]; then src=$FROM
   elif [[ -n $PKG_URL ]]; then src=$PKG_URL; hint=$PKG_SIZE; accept="application/octet-stream"; ui_info "a kiadás saját csomagját töltöm le (a méret ismert: $(fmt_bytes "$hint"))"
   else src=$TARBALL_URL; fi
-  ui_info "forrás: $(strip_url "$src" | cut -c1-70)"
+  ui_info "forrás: $(strip_url "$src")"
   if ! fetch_retry "$src" "$part" 1 "$accept" "$MAX_DOWNLOAD" 1800 "Letöltés" "$hint"; then
     ui_live_clear
     if (( DL_TOO_BIG )); then rm -f -- "$part"; fail "a letöltés túl nagy (több mint $(fmt_bytes $MAX_DOWNLOAD))" "Ez nem a szokásos csomag – ellenőrizd a kiadást, vagy kérdezd a fejlesztőt."; fi
     if (( FETCH_RC == 0 )); then api_error "$FETCH_CODE"; fi
-    net_error
+    net_error download
   fi
   if (( DL_TOO_BIG )); then rm -f -- "$part"; fail "a letöltés túl nagy (több mint $(fmt_bytes $MAX_DOWNLOAD))" "Ez nem a szokásos csomag – ellenőrizd a kiadást, vagy kérdezd a fejlesztőt."; fi
   verify_tarball "$part"
@@ -1510,7 +1619,7 @@ sys_line() {
   l=${l//$'\t'/ }
   l=${l//[[:cntrl:]]/}                               # minden más vezérlőkarakter (pl. az ablakcímet átíró ESC ] … BEL) is: a terminálra és a naplóba csak nyomtatható szöveg kerül
   [[ -n $l ]] || return 0
-  log_raw "$l"
+  case $l in dlstatus:*|pmstatus:*) ;; *) log_raw "$l" ;; esac          # a folyamatjelző-sorok (másodpercenként tucatnyi) nélkül: a napló és a hibakeret utolsó sorai így a valódi üzeneteket mutatják
   case $l in
     '==> '*) sys_phase_item "${l#==> }" ;;
     dlstatus:*) IFS=: read -ra f <<<"$l"; apt_status "letöltés" "" "${f[2]:-}" ;;
@@ -1523,6 +1632,7 @@ sys_line() {
         apt_status "telepítés" "${f[*]:1:$((i - 1))}" "${f[$i]}"
       else apt_status "telepítés" "${f[1]:-}" ""; fi ;;
     pmerror:*) ui_warn "apt: ${l#pmerror:}" ;;
+    FIGYELEM:*) l=${l#FIGYELEM:}; ui_warn "${l# }" ;;      # a rendszer-előkészítő figyelmeztetései (pl. NTP nélküli hálózat, apt-forrás) a gazdának is látszanak, nem csak a naplóban
     *) SYS_LAST=$l ;;
   esac
   return 0
@@ -1547,6 +1657,28 @@ sys_redraw() {
     ui_live "${SPIN[$((TICK % SPIN_N))]} ${SYS_PHASE:-dolgozom}${SYS_LAST:+  $(ui_fit "$SYS_LAST" 40)}"
   fi
   return 0
+}
+
+# A rendszer-előkészítő (system/prepare-clock.sh) az apt előtt megvárja az NTP-szinkront (SIGNAGE_CLOCK_WAIT, alap 60 mp), és ha az nincs – márpedig céges hálózaton az UDP 123 tiltott,
+# ott a friss kép órája sosem szinkronizál –, megáll, hacsak nem kap megbízható időt (SIGNAGE_PC_EPOCH; a tools/provision.sh a PC idejét adja). A telepítő az órát már ELLENŐRIZTE
+# (1.–2. lépés: a GitHub TLS-en kapott Date fejléce, ha kellett, beállította): ezt az időt adjuk át, és a felesleges NTP-várakozást lerövidítjük. GitHub nélküli (--from) telepítésnél nincs hiteles
+# időforrás: ha az évszám hihető, az ellenőrzést kihagyjuk (az apt jelzi, ha az óra tényleg késik: explain_from_log).
+CLOCK_ENV=()
+prepare_clock_env() {
+  local now trusted up=""
+  CLOCK_ENV=()
+  now=$(printf '%(%s)T' -1)
+  # (a hitelesítetlen forrásból beállított óra – CLOCK_FIX_EPOCH – is megbízható időnek számít: a telepítő ésszerűségi határok közt maga állította be)
+  if [[ ( -n $HTTP_DATE_EPOCH || -n $CLOCK_FIX_EPOCH ) && -z $FROM_MODE ]]; then
+    trusted=$now
+    if [[ -z $CLOCK_FIX_EPOCH ]]; then trusted=$(( HTTP_DATE_EPOCH + now - HTTP_DATE_LOCAL )); fi
+    # a felvétel pillanata (uptime): a prepare-clock.sh az azóta eltelt időt (pl. az NTP-várakozást) hozzáadja, így a megadott idő nem "marad le"
+    if [[ -r /proc/uptime ]]; then read -r up _ </proc/uptime || up=""; up=${up%%.*}; fi
+    CLOCK_ENV=("SIGNAGE_PC_EPOCH=$trusted" "SIGNAGE_CLOCK_WAIT=${KIRAKAT_CLOCK_WAIT:-10}")
+    if [[ $up =~ ^[0-9]{1,9}$ ]]; then CLOCK_ENV+=("SIGNAGE_PC_UPTIME0=$up"); fi
+  elif [[ -n $FROM_MODE ]] && (( $(printf '%(%s)T' -1) >= MIN_EPOCH )); then
+    CLOCK_ENV=("SIGNAGE_SKIP_CLOCK_CHECK=1" "SIGNAGE_CLOCK_WAIT=${KIRAKAT_CLOCK_WAIT:-10}")
+  fi
 }
 
 # stream_cmd parancs… : a parancs (stdout+stderr) kimenetét soronként a sys_line dolgozza fel; a kilépési kódot STREAM_RC adja
@@ -1589,8 +1721,10 @@ apt_busy() {    # 0, ha egy másik apt / dpkg / automatikus frissítés fut
 }
 
 wait_apt_lock() {
-  local waited=0
+  local waited=0 told=0
   while apt_busy; do
+    # (egyszer, tartósan kiírva: a pörgettyű csak élő terminálon látszik, és az első indítás automatikus frissítése percekig tarthat)
+    if (( ! told )); then told=1; ui_info "egy másik csomagkezelő (pl. az első indítás automatikus frissítése) dolgozik – megvárom, legfeljebb $(fmt_dur "$APT_LOCK_WAIT") ideig"; fi
     if (( waited >= APT_LOCK_WAIT )); then fail "másik csomagkezelő (apt/dpkg) foglalja a zárat $(fmt_dur "$waited") óta" "Várd meg, míg befejezi (pl. automatikus frissítés), majd futtasd újra ugyanazt a parancsot."; fi
     ui_live "${SPIN[$((TICK % SPIN_N))]} várok egy másik csomagkezelőre (automatikus frissítés fut)… $(fmt_dur "$waited")"
     TICK=$((TICK + 1)); sleep 3; waited=$((waited + 3))
@@ -1599,14 +1733,46 @@ wait_apt_lock() {
   (( waited == 0 )) || ui_info "a csomagkezelő felszabadult ($(fmt_dur "$waited") várakozás után)"
 }
 
-fix_dpkg_state() {
-  local out
-  out="$("${SUDO[@]}" dpkg --audit 2>/dev/null || true)"
-  if [[ -n $out ]]; then
-    ui_warn "egy korábbi csomagtelepítés félbemaradt – rendbe teszem (dpkg --configure -a)"
-    run_logged "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold \
-      || fail "a félbemaradt csomagtelepítés rendbetétele nem sikerült" "Futtasd kézzel: sudo dpkg --configure -a, majd a telepítő parancsát újra."
+# Az apt-források https-re állítása 443-only hálózatra: a kiadás apt-https.sh horga, vagy – ha nincs – a telepítő saját átírása. Idempotens.
+apt_sources_to_https() {
+  if [[ -f $TREE/system/apt-https.sh ]]; then
+    ui_item "apt https-re (a kiadás system/apt-https.sh szkriptje)"
+    run_hook apt-https.sh "apt https-re"
+  else
+    apt_https_fix
   fi
+}
+
+# A dpkg-állapot rendbetétele a csomagtelepítés előtt. Két eset: (1) félbemaradt telepítés (pl. Ctrl-C, SSH-kiesés): `dpkg --configure -a` rendbe teszi;
+# (2) áramszünet / kilőtt apt után egy csomag „reinstreq” állapotba kerülhet („in a mess due to serious problems”): a `dpkg --configure -a` ezt NEM javítja
+# (hibát ad, vagy sikerrel tér vissza, de a csomag marad), újra kell telepíteni (`apt-get install --reinstall`) – a valódi rendszeren ezt a homokozó (S14) mutatta meg.
+dpkg_mess_names() {   # a `dpkg --audit` listasoraiból (egy szóközzel kezdődő „csomag[:arch]  leírás” sorok) a csomagnevek → DPKG_MESS tömb
+  local line; DPKG_MESS=()
+  while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]([a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?)([[:space:]]|$) ]]; then DPKG_MESS+=("${BASH_REMATCH[1]}"); fi
+  done < <("${SUDO[@]}" dpkg --audit 2>/dev/null || true)
+}
+DPKG_MESS=()
+
+fix_dpkg_state() {
+  local out cfg_rc=0
+  out="$("${SUDO[@]}" dpkg --audit 2>/dev/null || true)"
+  [[ -n $out ]] || return 0
+  ui_warn "egy korábbi csomagtelepítés félbemaradt – rendbe teszem (dpkg --configure -a)"
+  run_logged "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold || cfg_rc=$?
+  dpkg_mess_names
+  if (( ${#DPKG_MESS[@]} )); then
+    ui_warn "a következő csomag(ok) sérült állapotban maradt(ak), újratelepítem: ${DPKG_MESS[*]}"
+    apt_sources_to_https          # 443-only hálózaton a még http-s forrással az újratelepítés nem menne
+    run_logged "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update || true
+    run_logged "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${DPKG_MESS[@]}" \
+      || fail "a sérült csomag(ok) (${DPKG_MESS[*]}) újratelepítése nem sikerült" "Nézd meg a naplót (hálózat? csomagtár?), majd futtasd újra ugyanazt a parancsot; kézzel: sudo apt-get install --reinstall ${DPKG_MESS[*]}"
+    run_logged "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold || cfg_rc=$?
+    dpkg_mess_names
+    (( ${#DPKG_MESS[@]} == 0 )) || fail "a sérült csomag(ok) (${DPKG_MESS[*]}) az újratelepítés után is hibásak" "Futtasd kézzel: sudo apt-get install --reinstall ${DPKG_MESS[*]}, majd a telepítő parancsát újra."
+    cfg_rc=0
+  fi
+  (( cfg_rc == 0 )) || fail "a félbemaradt csomagtelepítés rendbetétele nem sikerült" "Futtasd kézzel: sudo dpkg --configure -a, majd a telepítő parancsát újra."
 }
 
 # Egy apt-forrás gazdagép elérhetősége: APT_REACH = http (a sima http megy) | https (csak a https megy) | none. A telepített rendszer /etc/apt forrásaiból jönnek a gazdagépek
@@ -1677,13 +1843,27 @@ detect_layout() {
   if [[ -r $APP_DIR/VERSION ]]; then read -r INSTALLED_VERSION <"$APP_DIR/VERSION" || true; INSTALLED_VERSION=${INSTALLED_VERSION//[[:space:]]/}; fi
 }
 
+# Az app-mappa ideiglenes / régi példányainak törlése (csak a telepítő saját .kirakat-* nevei). Ha root-tulajdonú maradék van bennük (pl. valaki `sudo python3`-mal futtatott valamit az /opt/signage
+# alatt, és a __pycache__ rooté lett), a sima törlés elbukik: sudo-val is megpróbáljuk; ha az sem megy, a maradék marad (a következő futás újra megpróbálja), de a telepítés nem akad el rajta.
+rm_app_tree() {
+  local p
+  for p in "$@"; do
+    [[ $p == "$APP_DIR"/.kirakat-* ]] || continue
+    [[ -e $p || -L $p ]] || continue
+    rm -rf -- "$p" 2>>"$WORK_LOG" && continue
+    "${SUDO[@]}" rm -rf -- "$p" >>"$WORK_LOG" 2>&1 || true
+    [[ ! -e $p ]] || log "figyelem: nem törölhető maradék: $p (a következő futás újra megpróbálja)"
+  done
+  return 0
+}
+
 # Egy mappa cseréje két szakaszban. 1) prep_dir: az új másolat a mellé készül (hosszú, megszakítható: félkész másolat legfeljebb mellette marad, a következő futás törli);
 # 2) commit_dir: két átnevezés – ezt MINDIG kritikus szakaszon belül hívjuk (crit_begin / crit_end), hogy egy Ctrl-C ne hagyjon fél cserét.
 # Kizárások: __pycache__, tests (server), spike (system).
 prep_dir() {    # $1 név (server|web|system)
   local name=$1 src="$TREE/$1" new="$APP_DIR/.kirakat-new-$1"
   [[ -d $src ]] || fail "a csomagból hiányzik a(z) $name mappa" "Szólj a fejlesztőnek."
-  rm -rf -- "${new:?}"
+  rm_app_tree "$new"
   cp -a -- "$src" "$new" || fail "a(z) $name másolása sikertelen" "Szabadíts fel helyet (df -h), majd futtasd újra ugyanazt a parancsot."
   find "$new" -type d -name __pycache__ -prune -exec rm -rf -- {} + 2>/dev/null || true
   case $name in
@@ -1697,10 +1877,11 @@ prep_dir() {    # $1 név (server|web|system)
 
 commit_dir() {  # $1 név – kritikus szakaszon belül
   local old="$APP_DIR/.kirakat-old-$1" new="$APP_DIR/.kirakat-new-$1" cur="$APP_DIR/$1"
-  rm -rf -- "${old:?}"
+  rm_app_tree "$old"
+  if [[ -e $old || -L $old ]]; then old="$old.$$"; fi        # a régi maradékot nem lehetett törölni: új néven tesszük félre a mostanit (a csere így sem akad el)
   if [[ -e $cur || -L $cur ]]; then mv -- "$cur" "$old"; fi
   mv -- "$new" "$cur"
-  rm -rf -- "${old:?}"
+  rm_app_tree "$old"
 }
 
 swap_dir() {    # $1 név: előkészítés + csere egyben (a server / web együtt cserélendő, ott a step_app két szakaszra bontja)
@@ -1712,10 +1893,11 @@ swap_dir() {    # $1 név: előkészítés + csere egyben (a server / web együt
 
 # Egy korábbi, megszakadt csere maradékai: ha a mappa hiányzik, de a régi megvan, visszaállítjuk; a félkész új másolatokat töröljük.
 recover_app_dir() {
-  local n
+  local n p
   for n in server web system; do
     if [[ ! -e $APP_DIR/$n && -d $APP_DIR/.kirakat-old-$n ]]; then mv -- "$APP_DIR/.kirakat-old-$n" "$APP_DIR/$n"; log "visszaállítva egy megszakadt cseréből: $n"; fi
-    rm -rf -- "${APP_DIR:?}/.kirakat-new-$n" "${APP_DIR:?}/.kirakat-old-$n"
+    rm_app_tree "$APP_DIR/.kirakat-new-$n" "$APP_DIR/.kirakat-old-$n"
+    for p in "$APP_DIR"/.kirakat-old-"$n".[0-9]*; do rm_app_tree "$p"; done
   done
   rm -f -- "$APP_DIR/VERSION.kirakat-new" "$APP_DIR/bin/player-session.kirakat-new"
 }
@@ -1769,12 +1951,7 @@ step_system() {
   fix_dpkg_state
 
   # kiegészítő horog (más fejlesztési ág szkriptje): ha a kiadás tartalmazza, lefut; nélküle a telepítő önállóan is teljes. (Az apply-network.sh a telepítés VÉGÉN fut, lásd apply_network_last.)
-  if [[ -f $TREE/system/apt-https.sh ]]; then
-    ui_item "apt https-re (a kiadás system/apt-https.sh szkriptje)"
-    run_hook apt-https.sh "apt https-re"
-  else
-    apt_https_fix
-  fi
+  apt_sources_to_https
   if [[ -f $TREE/system/apply-network.sh ]]; then HAVE_NET_HOOK=1; fi      # a gyorsítótár-fa a végére már törlődik: a jelenlétet itt jegyezzük fel
 
   # ha a hostname még alapértelmezett és az eth0 nincs meg (pl. end0 néven fut), a kiadás szkriptje elbukna: előbb a gépnevet adjuk meg
@@ -1811,14 +1988,29 @@ CONF
     [[ -f $script ]] || fail "hiányzik a rendszer-előkészítő szkript ($script)" "Szólj a fejlesztőnek."
   fi
   ui_info "ez tart a legtovább (5–15 perc): csomagok letöltése és telepítése"
-  SYS_PHASE=""; APT_KIND=""; SYS_LAST=""; PHASE_N=0
-  stream_cmd "${SUDO[@]}" env APP_USER="$APP_USER" APT_CONFIG="$STAGE/apt.conf" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a bash "$script"
-  if (( STREAM_RC != 0 )); then
+  # Ha közben egy másik csomagkezelő (az első indítás automatikus frissítése, apt-daily) elfoglalja a zárat, az apt azonnal hibával áll le („Could not get lock”): ezt nem kell a
+  # gazdának kézzel újraindítania – megvárjuk a zár felszabadulását, és a (visszafutó, idempotens) rendszer-előkészítőt legfeljebb háromszor újraindítjuk.
+  local attempt=0
+  while :; do
+    SYS_PHASE=""; APT_KIND=""; SYS_LAST=""; PHASE_N=0
+    prepare_clock_env
+    stream_cmd "${SUDO[@]}" env APP_USER="$APP_USER" APT_CONFIG="$STAGE/apt.conf" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${CLOCK_ENV[@]}" bash "$script"
+    (( STREAM_RC != 0 )) || break
     log "install-system.sh kilépési kódja: $STREAM_RC"
+    FAIL_CAUSE=""; FAIL_TODO=""
     explain_from_log
+    if [[ $FAIL_CAUSE == *"másik csomagkezelő"* ]] && (( attempt < 3 )); then
+      attempt=$((attempt + 1))
+      ui_warn "Közben egy másik csomagkezelő (pl. automatikus frissítés) elfoglalta a zárat – megvárom, majd újrapróbálom ($attempt/3)."
+      FAIL_CAUSE=""; FAIL_TODO=""
+      EXPLAIN_FROM=$(wc -l <"$WORK_LOG" 2>/dev/null || echo 0); EXPLAIN_FROM=${EXPLAIN_FROM//[!0-9]/}
+      wait_apt_lock
+      fix_dpkg_state
+      continue
+    fi
     [[ -n $FAIL_CAUSE ]] || { FAIL_CAUSE="a rendszer-előkészítés hibával állt le (kilépési kód $STREAM_RC)"; FAIL_TODO="Nézd meg a napló végét; ha átmeneti volt (hálózat), futtasd újra ugyanazt a parancsot."; }
     exit 1
-  fi
+  done
   ui_ok "a rendszer-előkészítés lefutott ($PHASE_N szakasz)"
   flush_log || true
   ui_step_done
@@ -1855,7 +2047,8 @@ user_systemctl() {
 wait_user_bus() {   # a felhasználói systemd elérhetősége (linger után néhány másodperc)
   local i rtd="${XDG_RUNTIME_DIR:-/run/user/$APP_UID}"
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    if user_systemctl is-system-running >/dev/null 2>&1 || user_systemctl daemon-reload >/dev/null 2>&1; then return 0; fi
+    # (alhéjban, az átirányítás nélkül a főfolyamatban: ha a jel egy átirányított FÜGGVÉNYHÍVÁS közben érkezne, a kilépési csapda a /dev/null-ba írna, és a megszakítási üzenet – meg az esetleges új jelszó – elveszne)
+    if ( user_systemctl is-system-running ) >/dev/null 2>&1 || ( user_systemctl daemon-reload ) >/dev/null 2>&1; then return 0; fi
     ui_live "${SPIN[$((TICK % SPIN_N))]} a felhasználói systemd indulására várok…"
     TICK=$((TICK + 1)); sleep 1
   done
@@ -1988,6 +2181,7 @@ confirm_ssh_keyonly() {   # 0 = a gazda igent mondott
   (( HAVE_TTY && ! YES )) || return 1
   local ans=""
   ui_live_clear
+  drain_tty
   printf '%s' "Ezt az SSH-munkamenetet nem kulccsal nyitottad (vagy nem ellenőrizhető). Kikapcsoljam az SSH jelszavas belépését? Utána CSAK a ~/.ssh/authorized_keys kulcsaival lehet belépni. [i/N] " >/dev/tty
   IFS= read -r ans </dev/tty || true
   [[ $ans == [iIyY]* ]]
@@ -2008,7 +2202,7 @@ step_os() {
     # egy újrafuttatás ne vegye el a gazdától a felületen / kézzel megváltoztatott jelszót
     OS_PW_MODE=kept; ui_info "rendszerjelszó: a MAC-ből számolt gyári jelszót egy korábbi telepítés már beállította – nem írom felül (visszaállítás a gyárira: PC-n tools/set-os-password.sh)"
   elif (( HAVE_KEY )) && [[ -f $tool ]]; then
-    if [[ ! $MAC =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then fail "az eszköz MAC-címe nem állapítható meg ($MAC)" "Ellenőrizd a hálózati csatolót (ip link); a rendszerjelszó beállítását kihagyhatod a --keep-os-password kapcsolóval."; fi
+    if [[ ! $MAC =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then fail "az eszköz MAC-címe nem állapítható meg${MAC:+ (olvasott érték: $MAC)}" "Ellenőrizd a hálózati csatolót (ip link; a csatoló MAC-címe a /sys/class/net/<név>/address fájlban van); a rendszerjelszó beállítását kihagyhatod a --keep-os-password kapcsolóval."; fi
     ( umask 077; OS_PASSWORD_KEY_FILE="$KEY_FILE" python3 -I "$tool" derive --mac "$MAC" >"$pwfile" ) \
       || fail "a MAC-ból számolt jelszó nem állítható elő" "A telepítőkódban lévő támogatási kulcs hibás lehet – kérj újat (tools/make-install-code.sh); vagy használd a --keep-os-password kapcsolót."
     OS_PW_MODE=derived
@@ -2027,10 +2221,13 @@ step_os() {
     "${SUDO[@]}" install -m 600 -o "$ROOT_OWNER" -g "$ROOT_GROUP" -- "$pwfile" "$STAGE/os-password" >>"$WORK_LOG" 2>&1 \
       || fail "a jelszófájl gyökér-tulajdonú másolata nem készíthető el" "Szabadíts fel helyet (df -h), majd futtasd újra ugyanazt a parancsot."
     shred_file "$pwfile"
+    # a jelszócsere előtt jelöljük (ha a folyamat a csere közben hal meg, a következő futás tudja, hogy a jelszó már a MAC-ból számolt lehet)
+    if [[ $OS_PW_MODE == derived ]]; then mark_os_password derived-pending; fi
     crit_begin
     # a kritikus szakasz legfeljebb ennyi ideig tarthat (egy elakadt chpasswd miatt a telepítő ne legyen megszakíthatatlan)
     if run_logged timeout -k 3 "${KIRAKAT_CRIT_TIMEOUT:-60}" "${SUDO[@]}" env APP_USER="$APP_USER" bash "$RTREE/system/set-os-password.sh" "$STAGE/os-password"; then
       crit_end
+      OS_PW_APPLIED=1
       if [[ $OS_PW_MODE == derived ]]; then
         ui_ok "rendszerjelszó: a MAC-címből számolt gyári jelszó beállítva (PC-n: tools/os-password.py derive --mac $MAC)"; mark_os_password derived
       else
@@ -2047,7 +2244,7 @@ step_os() {
   # SSH: kulcsos belépésre csak akkor váltunk, ha van engedélyezett kulcs, az sshd el is fogadná (StrictModes), és biztos, hogy nem zárjuk ki a gazdát
   local ak="${KIRAKAT_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}" haskey=0 l re_key='(^|[[:space:]])(ssh-[a-z0-9]+|ecdsa-sha2-[a-z0-9]+|sk-[a-z0-9@.-]+)[[:space:]]+AAAA'
   if [[ -s $ak ]]; then
-    while IFS= read -r l; do
+    while IFS= read -r l || [[ -n $l ]]; do      # az újsor nélküli utolsó sor is (egy kézzel beillesztett kulcsnál gyakori)
       if [[ $l != '#'* && $l =~ $re_key ]]; then haskey=1; break; fi
     done <"$ak"
   fi
@@ -2268,7 +2465,7 @@ usage() {
   cat <<'USAGE'
 Kirakat – egyparancsos telepítő (ODROID-M2)
 
-Használat:  curl -sL https://gamekiller168.github.io/i | bash [-s -- KAPCSOLÓK]
+Használat:  curl -fsSL https://gamekiller168.github.io/i | bash [-s -- KAPCSOLÓK]
 
   --version vX.Y.Z      egy adott kiadás (alap: a legfrissebb)
   --code-file FÁJL      a telepítőkód fájlból (vagy KIRAKAT_CODE környezeti változó)
@@ -2317,23 +2514,37 @@ parse_args() {
   fi
 }
 
-# Egy korábbi, megölt futás (SIGKILL, áramszünet) maradványai: a titkokat tartalmazó ideiglenes mappák törlése (a zár megszerzése után hívjuk: nem fut másik telepítő;
-# a 2 percnél frissebb mappákhoz nem nyúlunk – az egy párhuzamos, csak olvasó --check futásé lehet).
+# Egy korábbi, megölt futás (SIGKILL, áramszünet) maradványai: a titkokat tartalmazó ideiglenes mappák törlése (a zár megszerzése után hívjuk: nem fut másik telepítő).
+# A mappában lévő `pid` fájl dönt: él a folyamat (egy párhuzamos, csak olvasó --check futás – annak külön a zárja) → nem nyúlunk hozzá; halott → azonnal törlődik.
+# pid fájl nélküli (régi / sérült) mappa csak 2 percnél régebbi esetén törölhető.
 sweep_stale() {
-  local base d f n=0
+  local base d f p n=0
   for base in "${TMPDIR:-/tmp}" "$RT_DIR"; do
     [[ -d $base ]] || continue
     while IFS= read -r -d '' d; do
       [[ $d != "$WORK" && $d != "$SECRETS" && ! -L $d && -O $d ]] || continue
+      p=""; if [[ -r $d/pid ]]; then read -r p <"$d/pid" || p=""; fi
+      if [[ $p =~ ^[0-9]{1,9}$ ]]; then
+        if kill -0 "$p" 2>/dev/null; then continue; fi
+      elif [[ -z $(find "$d" -maxdepth 0 -mmin +2 -print 2>/dev/null) ]]; then
+        continue
+      fi
       for f in "$d"/* "$d"/.[!.]*; do shred_file "$f"; done
       rm -rf -- "${d:?}" && n=$((n + 1))
-    done < <(find "$base" -maxdepth 1 -type d -name 'kirakat-install.*' -user "$APP_USER" -mmin +2 -print0 2>/dev/null)
+    done < <(find "$base" -maxdepth 1 -type d -name 'kirakat-install.*' -user "$APP_USER" -print0 2>/dev/null)
   done
   if (( n )); then ui_info "egy korábbi, megszakadt futás maradványait ($n ideiglenes mappa) törölte a telepítő"; fi
   return 0
 }
 
 main() {
+  # A szkript utolsó sora `main "$@" --kirakat-script-end`: egy megszakadt `curl | bash` letöltésnél a csonka vég akkor is lefuthatna, ha a vágás épp a `main` szó után esik
+  # (a `main` önmagában teljes parancs) – a záró jelző nélkül a telepítő nem indul el.
+  if [[ ${!#:-} != --kirakat-script-end ]]; then
+    printf 'A telepítő szkript csonkán töltődött le (megszakadt letöltés?) – semmi nem történt. Futtasd újra a parancsot.\n' >&2
+    exit 1
+  fi
+  set -- "${@:1:$#-1}"
   # a KIRAKAT_CODE környezeti változót azonnal átvesszük egy (nem exportált) shell-változóba, és kivesszük a környezetből: egyetlen gyerekfolyamat sem örökli
   PENDING_CODE="${KIRAKAT_CODE:-}"
   unset KIRAKAT_CODE
@@ -2360,6 +2571,8 @@ main() {
   if [[ -d $RT_DIR && -w $RT_DIR && -O $RT_DIR ]]; then SECRETS="$(mktemp -d "$RT_DIR/kirakat-install.XXXXXX" 2>/dev/null)" || SECRETS=""; fi
   [[ -n $SECRETS ]] || SECRETS=$WORK
   chmod 700 "$SECRETS"
+  # a folyamat azonosítója a munkamappákban: egy megölt (SIGKILL / áramszünet) futás maradványait a következő futás AZONNAL törli (nem kell megvárni a 2 percet)
+  printf '%s\n' "$$" >"$WORK/pid"; if [[ $SECRETS != "$WORK" ]]; then printf '%s\n' "$$" >"$SECRETS/pid"; fi
   local lockdir=$WORK
   if (( ! CHECK )); then
     # a letöltés és az állapot a felhasználó saját (0700-as) mappájában él, hogy megszakadás után folytatható legyen; a --check ide sem ír
@@ -2372,7 +2585,8 @@ main() {
   install_signal_traps
 
   ui_banner
-  # egyszerre csak egy telepítő futhat
+  # egyszerre csak egy telepítő futhat (a zár a `flock`-ra épül: hiányában a „másik telepítő fut” üzenet félrevezető lenne)
+  need_cmd flock || fail "hiányzó program: flock" "A Hardkernel Ubuntu image tartalmazza (util-linux) – ellenőrizd, hogy a megfelelő image fut-e; apt nélkül a telepítő nem tudja pótolni."
   acquire_lock "$lockdir/lock" || fail "másik telepítő fut már ezen az eszközön" "Várd meg, míg befejezi, vagy lépj be újra és ellenőrizd (ps aux | grep install)."
   if (( ! CHECK )); then sweep_stale; fi
   if [[ -n $STATE_FILE && -f $STATE_FILE ]]; then
@@ -2412,4 +2626,4 @@ main() {
   return 0
 }
 
-main "$@"
+main "$@" --kirakat-script-end
